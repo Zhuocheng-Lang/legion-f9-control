@@ -2,10 +2,9 @@
 //!
 //! 发现优先使用服务 UUID，其次名称；不持久化真实地址；明确连接/扫描超时。
 
-use std::str::FromStr;
 use std::time::Duration;
 
-use btleplug::api::{Central, Manager, ScanFilter};
+use btleplug::api::{Central, Manager};
 use btleplug::platform::{Adapter, Manager as PlatformManager};
 use f9_protocol::ids::BLE_SERVICE_UUID;
 use f9_transport::{Capability, DeviceCandidate, TransportError, TransportKind};
@@ -57,9 +56,7 @@ async fn scan_peripherals(
         .map_err(|e| TransportError::Internal(format!("ble manager: {e}")))?;
     let adapter = central_adapter(&manager).await?;
     adapter
-        .start_scan(ScanFilter {
-            services: vec![uuid::Uuid::from_str(BLE_SERVICE_UUID).expect("valid uuid")],
-        })
+        .start_scan(linux_impl::scan_filter())
         .await
         .map_err(|e| TransportError::Internal(format!("ble scan: {e}")))?;
     tokio::time::sleep(timeout.min(Duration::from_secs(10))).await;

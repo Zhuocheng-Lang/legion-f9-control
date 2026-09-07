@@ -22,7 +22,8 @@ pub(crate) struct LinuxBle {
     pub notify_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     /// 单 in-flight 请求许可。
     pub inflight: Arc<Mutex<()>>,
-    /// 通知队列溢出计数。
+    /// 通知队列溢出计数（溢出丢弃时递增；由 daemon 结构化日志接线读取）。
+    #[allow(dead_code)]
     pub queue_overflow: Arc<AtomicU64>,
 }
 

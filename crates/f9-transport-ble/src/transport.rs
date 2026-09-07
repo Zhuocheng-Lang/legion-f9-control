@@ -32,7 +32,7 @@ pub struct BleTransport {
 impl BleTransport {
     /// 从已连接的 Linux 内部实现构造。
     #[cfg(target_os = "linux")]
-    pub fn from_linux(inner: linux_impl::LinuxBle) -> Self {
+    pub(crate) fn from_linux(inner: linux_impl::LinuxBle) -> Self {
         use f9_transport::Capability;
         Self {
             identity: TransportIdentity {
