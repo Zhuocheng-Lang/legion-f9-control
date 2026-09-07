@@ -130,9 +130,9 @@ pub struct IpcListener;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{IpcRequest, Method};
     #[cfg(unix)]
     use crate::{PROTOCOL_VERSION, check_request_version};
-    use crate::{IpcRequest, Method};
 
     #[test]
     fn socket_path_prefers_f9_runtime_dir() {
