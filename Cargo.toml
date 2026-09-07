@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/f9-protocol",
+    "crates/f9-transport",
+    "crates/f9-transport-usb",
+    "crates/f9-transport-ble",
+    "crates/f9-core",
+    "crates/f9-sim",
+    "crates/f9-ipc",
+    "apps/f9ctl",
+    "apps/f9d",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/legion-f9-control/legion-f9-control"
+readme = "README.md"
+
+[workspace.dependencies]
+f9-protocol = { path = "crates/f9-protocol" }
+f9-transport = { path = "crates/f9-transport" }
+f9-transport-usb = { path = "crates/f9-transport-usb" }
+f9-transport-ble = { path = "crates/f9-transport-ble" }
+f9-core = { path = "crates/f9-core" }
+f9-sim = { path = "crates/f9-sim" }
+f9-ipc = { path = "crates/f9-ipc" }
+
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util", "signal", "fs", "process"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+directories = "6"
+proptest = "1.7"
+tokio-stream = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

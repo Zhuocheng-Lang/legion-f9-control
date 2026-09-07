@@ -1,0 +1,18 @@
+[package]
+name = "f9-sim"
+description = "Deterministic Legion F9 device simulator with fault injection for CI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+f9-protocol.workspace = true
+f9-transport.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

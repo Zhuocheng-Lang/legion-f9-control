@@ -1,0 +1,34 @@
+[package]
+name = "f9d"
+description = "f9d: user-level thermal control daemon for Lenovo Legion F9 coolers (unofficial)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "f9d"
+path = "src/main.rs"
+
+[dependencies]
+f9-protocol.workspace = true
+f9-transport.workspace = true
+f9-transport-usb.workspace = true
+f9-transport-ble.workspace = true
+f9-core.workspace = true
+f9-sim.workspace = true
+f9-ipc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+directories.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

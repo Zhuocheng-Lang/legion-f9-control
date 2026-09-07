@@ -1,0 +1,20 @@
+# f9d.service — 用户级守护进程（SPEC §13.1、§20.2）。
+# 不得硬编码开发者 home、仓库绝对路径或虚拟环境。
+[Unit]
+Description=Lenovo Legion F9 cooler thermal control daemon (unofficial)
+Documentation=https://github.com/legion-f9-control/legion-f9-control
+After=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/f9d run
+Restart=on-failure
+RestartSec=5
+# 仅本用户；不提权。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

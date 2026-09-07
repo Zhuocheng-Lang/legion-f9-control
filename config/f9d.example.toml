@@ -1,0 +1,47 @@
+# f9d 默认配置示例（SPEC §13.2）。
+# 安装路径：$XDG_CONFIG_HOME/legion-f9-control/config.toml
+# 校验：f9ctl config validate（不访问硬件）
+
+schema_version = 1
+
+[device]
+# auto | usb | ble
+transport = "auto"
+# selector 不得默认写入 MAC/序列号；留空表示不筛选。
+# selector = ""
+
+[daemon]
+enabled = true
+# 轮询间隔（支持 ms/s/m/h）。
+poll_interval = "3s"
+# 任意两次实际写入的最小间隔（最短驻留）。
+min_dwell = "15s"
+# 降挡滞回：需低于当前挡触发阈值至少该差值。
+hysteresis_c = 3.0
+# daemon 默认禁用 turbo（SPEC §11.2）。
+allow_turbo = false
+# 连续失败阈值；达到后进入只读降级。
+failure_threshold = 3
+# 降级后只探测读取，一次完整读取成功后恢复控制。
+read_only_recovery = true
+
+# 温度-挡位阶梯曲线（at_c 必须严格升序，首点为 0.0）。
+[[daemon.curve]]
+at_c = 0.0
+mode = "quiet"
+
+[[daemon.curve]]
+at_c = 50.0
+mode = "balanced"
+
+[[daemon.curve]]
+at_c = 60.0
+mode = "beast"
+
+[logging]
+# error | warn | info | debug | trace（也可用 RUST_LOG 覆盖）
+level = "info"
+# human | json
+format = "human"
+# 日志脱敏 BLE 地址、USB 序列号与用户路径。
+redact_device_ids = true

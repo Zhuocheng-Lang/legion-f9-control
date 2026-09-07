@@ -1,0 +1,20 @@
+[package]
+name = "f9-ipc"
+description = "Versioned local Unix-domain-socket IPC between f9ctl and f9d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+[toolchain]
+# 固定 CI 与开发工具链；升级时同步更新 CI 矩阵与 CHANGELOG。
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

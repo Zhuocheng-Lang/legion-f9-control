@@ -1,0 +1,26 @@
+[package]
+name = "f9-core"
+description = "Device API, write transactions, safety policy and daemon control logic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+f9-protocol = { workspace = true, features = ["serde"] }
+f9-transport.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+f9-sim.workspace = true
+proptest.workspace = true
+toml.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
