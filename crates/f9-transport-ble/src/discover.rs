@@ -16,7 +16,7 @@ use crate::transport::linux_impl;
 pub async fn ble_candidates_public(
     timeout: Duration,
 ) -> Result<Vec<DeviceCandidate>, TransportError> {
-    let periphs = scan_peripherals(timeout).await?;
+    let (periphs, _adapter) = scan_peripherals(timeout).await?;
     Ok(periphs
         .into_iter()
         .map(|p| DeviceCandidate {

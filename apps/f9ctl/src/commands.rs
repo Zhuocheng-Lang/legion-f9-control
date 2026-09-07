@@ -1,13 +1,14 @@
 //! CLI 命令实现（SPEC §11）。
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use f9_core::Device;
 use f9_protocol::Gear;
 use f9_transport::{Transport, TransportError};
 
-use crate::connect::{Connection, TransportArg, connect, connect_direct, list_candidates};
+use crate::connect::{
+    Connection, LockedTransport, TransportArg, connect, connect_direct, list_candidates,
+};
 use crate::output::{self, Envelope, OutputMode};
 use crate::{CommandFailure, ExitCode};
 
@@ -81,6 +82,15 @@ impl Ctx {
     }
 }
 
+fn connection_failure(error: TransportError) -> CommandFailure {
+    match error {
+        TransportError::Disconnected => {
+            CommandFailure::new(ExitCode::NoDevice, "no_device", "未发现设备")
+        }
+        other => CommandFailure::from(f9_core::DeviceError::from(other)),
+    }
+}
+
 // ---------------------------------------------------------------- devices
 
 pub async fn devices_list(ctx: &Ctx) -> Result<(i32, Vec<Envelope>), CommandFailure> {
@@ -110,15 +120,16 @@ pub async fn devices_list(ctx: &Ctx) -> Result<(i32, Vec<Envelope>), CommandFail
 
 // ---------------------------------------------------------------- status/info
 
-async fn direct_transport(ctx: &Ctx) -> Result<Arc<dyn Transport>, CommandFailure> {
-    connect_direct(ctx.transport, ctx.device.as_deref())
+async fn direct_transport(ctx: &Ctx) -> Result<LockedTransport, CommandFailure> {
+    let transport = connect_direct(ctx.transport, ctx.device.as_deref())
         .await
         .map_err(|e| match e {
             TransportError::Disconnected => {
                 CommandFailure::new(ExitCode::NoDevice, "no_device", "未发现设备")
             }
             other => CommandFailure::from(f9_core::DeviceError::from(other)),
-        })
+        })?;
+    LockedTransport::new(transport).map_err(|e| CommandFailure::from(f9_core::DeviceError::from(e)))
 }
 
 pub async fn status(ctx: &Ctx) -> Result<(i32, Vec<Envelope>), CommandFailure> {
@@ -129,14 +140,15 @@ pub async fn status(ctx: &Ctx) -> Result<(i32, Vec<Envelope>), CommandFailure> {
         ctx.no_daemon,
         ctx.output,
     )
-    .await?
+    .await
+    .map_err(connection_failure)?
     {
         Connection::Daemon => {
             let resp = ipc_call(&f9_ipc::Method::Status, None).await?;
             (0, vec![ipc_envelope(command, resp)])
         }
-        Connection::Direct(t) => {
-            let dev = Device::new_shared(t);
+        Connection::Direct(locked) => {
+            let dev = Device::new_shared(locked.transport.clone());
             let st = dev.status().await.map_err(CommandFailure::from)?;
             let gear = dev.gear().await.ok().map(|g| g.as_str().to_owned());
             let id = dev.identity().device_id.clone();
@@ -160,8 +172,8 @@ pub async fn status(ctx: &Ctx) -> Result<(i32, Vec<Envelope>), CommandFailure> {
 
 pub async fn info(ctx: &Ctx) -> Result<(i32, Vec<Envelope>), CommandFailure> {
     let command = "info";
-    let t = direct_transport(ctx).await?;
-    let dev = Device::new_shared(t);
+    let locked = direct_transport(ctx).await?;
+    let dev = Device::new_shared(locked.transport.clone());
     let info = dev.info().await.map_err(CommandFailure::from)?;
     let device_info = dev.device_info().await.ok();
     let id = dev.identity().device_id.clone();
@@ -197,14 +209,15 @@ pub async fn mode_get(ctx: &Ctx) -> Result<(i32, Vec<Envelope>), CommandFailure>
         ctx.no_daemon,
         ctx.output,
     )
-    .await?
+    .await
+    .map_err(connection_failure)?
     {
         Connection::Daemon => {
             let resp = ipc_call(&f9_ipc::Method::ModeGet, None).await?;
             (0, vec![ipc_envelope(command, resp)])
         }
-        Connection::Direct(t) => {
-            let dev = Device::new_shared(t);
+        Connection::Direct(locked) => {
+            let dev = Device::new_shared(locked.transport.clone());
             let gear = dev.gear().await.map_err(CommandFailure::from)?;
             let id = dev.identity().device_id.clone();
             let kind = dev.identity().kind.as_str().to_owned();
@@ -227,7 +240,8 @@ pub async fn mode_set(ctx: &Ctx, gear: Gear) -> Result<(i32, Vec<Envelope>), Com
         ctx.no_daemon,
         ctx.output,
     )
-    .await?
+    .await
+    .map_err(connection_failure)?
     {
         Connection::Daemon => {
             let resp = ipc_call(&f9_ipc::Method::ModeSet, Some(gear.as_str().to_owned())).await?;
@@ -240,8 +254,8 @@ pub async fn mode_set(ctx: &Ctx, gear: Gear) -> Result<(i32, Vec<Envelope>), Com
             }
             (0, vec![ipc_envelope(command, resp)])
         }
-        Connection::Direct(t) => {
-            let dev = Device::new_shared(t);
+        Connection::Direct(locked) => {
+            let dev = Device::new_shared(locked.transport.clone());
             if gear == Gear::Turbo {
                 // SPEC §11.2：每次直接调用允许，但必须打印供电/回退提示。
                 warnings.push(
@@ -279,15 +293,22 @@ pub async fn monitor(
     ctx: &Ctx,
     interval: Duration,
 ) -> Result<(i32, Vec<Envelope>), CommandFailure> {
-    let t = direct_transport(ctx).await?;
-    let dev = Device::new_shared(t);
-    let id = dev.identity().device_id.clone();
-    let kind = dev.identity().kind.as_str().to_owned();
+    let mut locked = Some(direct_transport(ctx).await?);
     let is_json = ctx.output == OutputMode::Json;
     if !is_json {
         eprintln!("监控中，按 Ctrl+C 退出（间隔 {}ms）", interval.as_millis());
     }
     loop {
+        let Some(active) = locked.as_ref() else {
+            return Err(CommandFailure::new(
+                ExitCode::Internal,
+                "monitor_state",
+                "monitor transport missing",
+            ));
+        };
+        let dev = Device::new_shared(active.transport.clone());
+        let id = dev.identity().device_id.clone();
+        let kind = dev.identity().kind.as_str().to_owned();
         match dev.status().await {
             Ok(st) => {
                 if is_json {
@@ -310,7 +331,26 @@ pub async fn monitor(
                 } else {
                     eprintln!("设备断开，等待重连…");
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = dev.close().await;
+                drop(dev);
+
+                // 原 transport 已失效：释放其设备锁并重新执行发现/选择。
+                drop(locked.take());
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    match direct_transport(ctx).await {
+                        Ok(next) => {
+                            locked = Some(next);
+                            if !is_json {
+                                eprintln!("设备已重新连接");
+                            }
+                            break;
+                        }
+                        Err(e) if matches!(e.code, ExitCode::NoDevice | ExitCode::Timeout) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                continue;
             }
             Err(e) => return Err(CommandFailure::from(e)),
         }
@@ -532,8 +572,8 @@ pub struct RawParams {
 
 pub async fn debug_raw(ctx: &Ctx, p: &RawParams) -> Result<(i32, Vec<Envelope>), CommandFailure> {
     let command = "debug.raw";
-    let t = direct_transport(ctx).await?;
-    let kind = t.identity().kind;
+    let locked = direct_transport(ctx).await?;
+    let kind = locked.transport.identity().kind;
     let req = if let Some(data_hex) = &p.data {
         let payload = parse_hex(data_hex)
             .map_err(|e| CommandFailure::new(ExitCode::Usage, "invalid_input", e))?;
@@ -568,7 +608,7 @@ pub async fn debug_raw(ctx: &Ctx, p: &RawParams) -> Result<(i32, Vec<Envelope>),
             f9_core::unsafe_write_digest(&req)
         );
     }
-    let dev = Device::new_shared(t);
+    let dev = Device::new_shared(locked.transport.clone());
     let resp = dev
         .raw_exchange(req, policy, p.unlocked)
         .await

@@ -26,9 +26,28 @@ impl TransportArg {
 
 /// 活动连接：直连设备句柄或 daemon IPC。
 pub enum Connection {
-    Direct(Arc<dyn Transport>),
+    Direct(LockedTransport),
     /// daemon 接管硬件时，CLI 通过 IPC 交互。
     Daemon,
+}
+
+/// 持有直连 transport 及其进程级设备锁。
+///
+/// 锁必须与整个命令事务同寿命，不能在连接函数返回时提前释放。
+pub struct LockedTransport {
+    pub transport: Arc<dyn Transport>,
+    _lock: f9_core::DeviceLock,
+}
+
+impl LockedTransport {
+    pub(crate) fn new(transport: Arc<dyn Transport>) -> Result<Self, TransportError> {
+        let lock = f9_core::locks::try_lock(transport.identity().kind)
+            .map_err(|_| TransportError::Busy)?;
+        Ok(Self {
+            transport,
+            _lock: lock,
+        })
+    }
 }
 
 /// 列出全部候选设备（脱敏）。
@@ -141,16 +160,6 @@ pub async fn connect(
             return Ok(Connection::Daemon);
         }
     }
-    // 直连前检查设备锁（daemon 持锁时 Busy）。
-    let kind = match choice.and_then(|t| t.kind()) {
-        Some(k) => k,
-        None => {
-            // auto：按先 USB 后 BLE 的顺序探测锁（立即释放，仅探测）。
-            let _ = f9_core::locks::try_lock(TransportKind::Usb);
-            TransportKind::Usb
-        }
-    };
-    let _lock = f9_core::locks::try_lock(kind).map_err(|_| TransportError::Busy)?;
-    let t = connect_direct(choice, device).await?;
-    Ok(Connection::Direct(t))
+    let transport = connect_direct(choice, device).await?;
+    Ok(Connection::Direct(LockedTransport::new(transport)?))
 }
