@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }} -p f9ctl -p f9d
       - name: Package (Linux)

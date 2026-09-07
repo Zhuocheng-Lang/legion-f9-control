@@ -1,7 +1,7 @@
 //! 进程级 advisory 设备锁（SPEC §14）。
 //!
 //! 每个物理设备一把锁；daemon 持锁时，CLI 直连返回 Busy（不抢占）。
-//! Unix 使用 flock；Windows 使用独占打开（share_mode 0）。无 unsafe。
+//! Unix 使用 flock（经 rustix 安全 API）；Windows 使用独占打开（share_mode 0）。无 unsafe。
 
 use std::path::PathBuf;
 
@@ -30,8 +30,9 @@ impl Drop for DeviceLock {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
-            use std::os::unix::io::AsRawFd;
-            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            use rustix::fs::{FlockOperation, flock};
+            // Drop 不能返回错误；释放 advisory 锁失败时静默忽略（进程退出亦会释放）。
+            let _ = flock(self.file.as_fd(), FlockOperation::Unlock);
         }
         // Windows：关闭文件句柄即释放锁。锁文件保留（0 字节）以便下次独占打开。
         let _ = &self.path;
@@ -40,12 +41,9 @@ impl Drop for DeviceLock {
 
 #[cfg(unix)]
 fn acquire(file: &std::fs::File) -> Result<(), LockError> {
-    use std::os::unix::io::AsRawFd;
-    let rc = libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
-    if rc != 0 {
-        return Err(LockError::Busy);
-    }
-    Ok(())
+    use rustix::fs::{FlockOperation, flock};
+    // 非阻塞独占锁：已被其他进程持有时立即返回 Busy，不等待。
+    flock(file.as_fd(), FlockOperation::NonBlockingLockExclusive).map_err(|_| LockError::Busy)
 }
 
 #[cfg(windows)]

@@ -20,7 +20,7 @@ proptest.workspace = true
 toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 
 [lints]
 workspace = true

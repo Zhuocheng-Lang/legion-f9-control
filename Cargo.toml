@@ -18,17 +18,17 @@ version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/legion-f9-control/legion-f9-control"
+repository = "https://github.com/Zhuocheng-Lang/legion-f9-control"
 readme = "README.md"
 
 [workspace.dependencies]
-f9-protocol = { path = "crates/f9-protocol" }
-f9-transport = { path = "crates/f9-transport" }
-f9-transport-usb = { path = "crates/f9-transport-usb" }
-f9-transport-ble = { path = "crates/f9-transport-ble" }
-f9-core = { path = "crates/f9-core" }
-f9-sim = { path = "crates/f9-sim" }
-f9-ipc = { path = "crates/f9-ipc" }
+f9-protocol = { path = "crates/f9-protocol", version = "1.0.0" }
+f9-transport = { path = "crates/f9-transport", version = "1.0.0" }
+f9-transport-usb = { path = "crates/f9-transport-usb", version = "1.0.0" }
+f9-transport-ble = { path = "crates/f9-transport-ble", version = "1.0.0" }
+f9-core = { path = "crates/f9-core", version = "1.0.0" }
+f9-sim = { path = "crates/f9-sim", version = "1.0.0" }
+f9-ipc = { path = "crates/f9-ipc", version = "1.0.0" }
 
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
