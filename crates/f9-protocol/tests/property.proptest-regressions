@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 800bc49776b5fc85f0bc9221333040c59a0229ab8f2b3d8a734c438c01a58992 # shrinks to req = Request { command: SessionOpen, offset: 0, length: 1, payload: [] }
+cc 3652f7a55a08f819a68b4c694ab8bfd7959636705784c7e730c1b5e70049045e # shrinks to req = Request { command: SessionOpen, offset: 0, length: 1, payload: [] }

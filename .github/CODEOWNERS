@@ -1,0 +1,7 @@
+# 所有者清单（SPEC §19 合并保护要求）。
+*                                       @legion-f9-control/maintainers
+/crates/f9-protocol/                    @legion-f9-control/protocol-owners
+/crates/f9-core/                        @legion-f9-control/protocol-owners
+/crates/f9-transport-usb/               @legion-f9-control/protocol-owners
+/crates/f9-transport-ble/               @legion-f9-control/protocol-owners
+/.github/workflows/release.yml          @legion-f9-control/release-owners

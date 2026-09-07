@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+*.orig
+coverage/
+*.lcov
+/agetemplate/
+# 敏感与私有材料永不入库
+*.pcap
+*.pcapng
+*.rep
+*.gpr
+*.exe
+*.dll
+*.bin

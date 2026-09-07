@@ -1,0 +1,28 @@
+[package]
+name = "f9-transport-ble"
+description = "BLE transport for Legion F9 devices (Linux; Windows BLE explicitly unsupported in v1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+f9-protocol.workspace = true
+f9-transport.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+btleplug = "0.11"
+uuid = { version = "1", features = ["v4"] }
+tokio-stream = "0.1"
+
+[features]
+default = []
+# windows-ble: v1 明确不支持；保留此 feature 仅用于编译期显式拒绝。
+windows-ble = []
+
+[lints]
+workspace = true

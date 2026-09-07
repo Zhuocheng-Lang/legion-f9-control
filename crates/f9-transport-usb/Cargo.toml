@@ -1,0 +1,30 @@
+[package]
+name = "f9-transport-usb"
+description = "USB HID transport (report ID 4) for Legion F9 devices: Linux stable, Windows experimental"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+f9-protocol.workspace = true
+f9-transport.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2", default-features = false, features = ["linux-static-libusb"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hidapi = { version = "2", default-features = false }
+
+[features]
+default = ["hid-backend"]
+# hid-backend: 使用 hidapi 枚举与收发。禁用后仅保留纯逻辑（供受限构建环境）。
+hid-backend = []
+
+[lints]
+workspace = true

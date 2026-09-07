@@ -1,0 +1,10 @@
+# legion-f9-control udev 规则（SPEC §10.2）。
+# 仅匹配目标 HID 设备（17ef:f00c），授予当前登录用户 uaccess；
+# 不得使用全局宽权限。
+ACTION=="add|change", SUBSYSTEM=="hidraw", \
+  ATTRS{idVendor}=="17ef", ATTRS{idProduct}=="f00c", \
+  TAG+="uaccess"
+
+ACTION=="add|change", SUBSYSTEM=="hid", \
+  ATTRS{idVendor}=="17ef", ATTRS{idProduct}=="f00c", \
+  TAG+="uaccess"

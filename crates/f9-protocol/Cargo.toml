@@ -1,0 +1,21 @@
+[package]
+name = "f9-protocol"
+description = "Len Legion F9 cooler protocol frames, commands and codecs (pure, no platform I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+# serde: 配置/IPC 序列化时启用（Gear 等枚举的小写序列化）。
+serde = ["dep:serde"]
+
+[lints]
+workspace = true

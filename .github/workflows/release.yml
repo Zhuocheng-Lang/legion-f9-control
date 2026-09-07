@@ -1,0 +1,89 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64 使用原生 ARM64 runner（SPEC：Linux aarch64 为正式平台）。
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} -p f9ctl -p f9d
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/f9ctl dist/
+          cp target/${{ matrix.target }}/release/f9d dist/
+          cp -r packaging dist/
+          cp config/f9d.example.toml dist/
+          cp README.md README.en.md LICENSE NOTICE.md CHANGELOG.md dist/
+          tar -czf legion-f9-control-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
+          sha256sum legion-f9-control-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > checksums.txt
+      - name: Package (Windows, experimental)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/f9ctl.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/f9d.exe dist/
+          Copy-Item README.md,README.en.md,LICENSE,NOTICE.md,CHANGELOG.md dist/
+          Compress-Archive -Path dist/* -DestinationPath legion-f9-control-${{ github.ref_name }}-${{ matrix.target }}.zip
+          (Get-FileHash legion-f9-control-${{ github.ref_name }}-${{ matrix.target }}.zip -Algorithm SHA256).Hash | Out-File -Encoding ascii checksums-windows.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+            checksums*.txt
+
+  sbom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cargo install --locked cargo-cyclonedx || cargo install cargo-cyclonedx
+          cargo cyclonedx --all --format json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: '**/*.cdx.json'
+
+  release:
+    needs: [build, sbom]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+      - name: Verify checksums & publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat dist-all/artifacts-*/checksums*.txt >> CHECKSUMS.txt
+          # 校验：每个 artifact 的 sha256 必须匹配
+          (cd dist-all && sha256sum -c ../CHECKSUMS.txt)
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "见 CHANGELOG.md。Windows 构建为 experimental。" \
+            dist-all/artifacts-*/*

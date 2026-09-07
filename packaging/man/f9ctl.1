@@ -1,0 +1,52 @@
+.\" f9ctl(1) 手册页（随发布更新）。
+.TH F9CTL 1 "2026" "legion-f9-control 1.0.0" "用户命令"
+.SH 名称
+f9ctl \- Lenovo Legion F9 散热器控制命令行（非官方）
+.SH 概要
+.B f9ctl
+[\fB\-\-transport\fR \fIauto|usb|ble\fR] [\fB\-\-device\fR \fIselector\fR] [\fB\-\-output\fR \fIhuman|json\fR] [\fB\-\-timeout\fR \fIduration\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-no\-daemon\fR] \fICOMMAND\fR
+.SH 描述
+为 Lenovo Legion F9 BT 散热器提供安全、可靠、可脚本化的非官方控制。
+非官方社区项目。Lenovo 和 Legion 是其各自权利人的商标；本项目与 Lenovo 无关联、无背书。
+.SH 命令
+.TP
+.B devices list
+列出设备与可用传输。
+.TP
+.B status
+读取实时状态与 RPM。
+.TP
+.B info
+读取设备信息（按能力）。
+.TP
+.B mode get / mode set <quiet|balanced|beast|turbo>
+读取或设置挡位。设置采用读-改-写、会话化写入与写后读回。
+.TP
+.B monitor [\-\-interval <duration>]
+持续监控；\-\-output json 时输出 JSON Lines。
+.TP
+.B daemon install|uninstall|start|stop|restart|status|logs|run
+管理用户级温控守护进程 f9d。
+.TP
+.B config path|show|validate
+配置路径、内容与校验（校验不访问硬件）。
+.TP
+.B debug raw \-\-cmd 0x1a [\-\-length N] [\-\-offset N] [\-\-data "..."] [\-\-unsafe\-write]
+受安全策略约束的 raw 调试。默认只读；写需 \-\-unsafe\-write 加确认词（TTY）或
+\fBF9CTL_UNSAFE_WRITE_ACK\fR=<命令摘要>（非交互）。OTA/report 5 永久拒绝。
+.SH 退出码
+0 成功；2 用法/配置错误；3 未发现设备；4 权限不足；5 设备忙；6 超时/断线；
+7 协议响应无效；8 验证失败或结果不确定；9 平台/transport 不支持；10 安全策略拒绝。
+.SH 环境
+.TP
+.B F9CTL_UNSAFE_WRITE_ACK
+非交互 raw 写确认（值为本次命令摘要）。
+.TP
+.B RUST_LOG
+日志级别。
+.SH 文件
+.TP
+.I ~/.config/legion-f9-control/config.toml
+f9d 配置（见 f9d.example.toml）。
+.SH 另见
+\fBf9d\fR(1), 项目 README 与 docs/。

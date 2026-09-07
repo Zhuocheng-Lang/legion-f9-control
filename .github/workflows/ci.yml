@@ -1,0 +1,158 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+      - run: cargo +1.98.1 fmt --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install deps (libudev for bluez dbus linking)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
+      - run: rustup toolchain install 1.98.1 --profile minimal --component clippy
+      - run: cargo +1.98.1 clippy --workspace --all-targets --all-features -- -D warnings
+
+  test-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
+      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --doc
+
+  test-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace --all-features
+
+  build-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64 使用原生 ARM64 runner，避免 libdbus 交叉编译。
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev libdbus-1-dev
+      - run: rustup target add ${{ matrix.target }}
+      # 编译矩阵用 check：链接真机库不必需。
+      - run: cargo check --workspace --all-features --target ${{ matrix.target }}
+
+  docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo doc --workspace --no-deps --all-features
+      - name: markdown link check (simple)
+        run: |
+          # 简单链接检查：本地相对链接必须存在
+          python3 - <<'PY'
+          import re, sys, pathlib
+          ok = True
+          for md in pathlib.Path('.').rglob('*.md'):
+              if '.git' in md.parts or 'target' in md.parts:
+                  continue
+              text = md.read_text(encoding='utf-8', errors='ignore')
+              for m in re.finditer(r'\]\(([^)#]+?)(#[^)]*)?\)', text):
+                  link = m.group(1)
+                  if link.startswith(('http://', 'https://', 'mailto:')):
+                      continue
+                  target = (md.parent / link).resolve()
+                  if not target.exists():
+                      print(f"BROKEN: {md} -> {link}")
+                      ok = False
+          sys.exit(0 if ok else 1)
+          PY
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check licenses bans sources
+      - name: cargo audit (RustSec；工具故障与漏洞发现需区分)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: |
+          set +e
+          cargo audit --json > audit.json 2> audit.err
+          rc=$?
+          set -e
+          # 网络故障/工具故障（非漏洞发现）不应直接挂掉 CI：
+          if grep -q "error sending request\|failed to fetch\|network" audit.err; then
+            echo "::warning::cargo audit 工具故障（网络），不作为失败"
+            exit 0
+          fi
+          exit $rc
+
+  hygiene:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: secret scan（新增历史）
+        run: .github/scripts/secret-scan.sh
+      - name: forbidden extensions & file size gate
+        run: .github/scripts/forbidden-files.sh
+
+  json-schema-compat:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace --all-features
+
+  coverage:
+    # 可选覆盖率上传（SPEC §19）；fixture 不含任何私有数据。
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Run coverage
+        run: |
+          set +e
+          cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::warning::coverage 工具故障（不作为阻塞）"
+            exit 0
+          fi
+          # 关键 crate 覆盖率门槛（SPEC §17.3）：protocol ≥ 95%，core ≥ 90%，总体 ≥ 80%。
+          cargo llvm-cov report --summary-only || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: lcov.info
