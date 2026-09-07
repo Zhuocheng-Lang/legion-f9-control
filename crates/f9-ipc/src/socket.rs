@@ -130,6 +130,8 @@ pub struct IpcListener;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::{PROTOCOL_VERSION, check_request_version};
     use crate::{IpcRequest, Method};
 
     #[test]
