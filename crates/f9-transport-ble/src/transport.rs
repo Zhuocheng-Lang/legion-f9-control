@@ -162,7 +162,7 @@ mod tests {
         // 非 Linux 平台才有占位构造（Linux 上 BleTransport::unsupported 不存在）。
         use super::{BleTransport, TransportError};
         use f9_protocol::{Command, Request};
-        use f9_transport::Transport;
+        use f9_transport::{ExchangePolicy, Transport};
         use std::time::Duration;
 
         let t = BleTransport::unsupported();
