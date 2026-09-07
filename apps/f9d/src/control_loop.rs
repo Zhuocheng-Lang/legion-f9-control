@@ -15,7 +15,7 @@ use f9_core::control::{Controller, DaemonPhase, Decision};
 use f9_ipc::{IpcRequest, IpcResponse};
 use f9_protocol::Gear;
 use f9_transport::{ExchangePolicy, Transport};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 /// daemon 共享状态（IPC 读侧）。
 /// 非 Unix 构建中仅测试使用（v1 daemon 限定 Linux）。
@@ -26,6 +26,7 @@ pub struct DaemonShared {
     pub rpm: Option<u16>,
     pub gear: Option<Gear>,
     pub paused: bool,
+    pub allow_turbo: bool,
     pub temperature_c: Option<f64>,
     pub last_write_at_ms: Option<u64>,
     pub transport: Option<String>,
@@ -38,6 +39,7 @@ impl Default for DaemonShared {
             rpm: None,
             gear: None,
             paused: false,
+            allow_turbo: false,
             temperature_c: None,
             last_write_at_ms: None,
             transport: None,
@@ -48,6 +50,12 @@ impl Default for DaemonShared {
 pub type SharedHandle = Arc<Mutex<DaemonShared>>; //（非 Unix 构建中仅测试使用）
 #[allow(unused_imports)]
 use std::sync::Arc as _unused_arc_reexport;
+
+/// 由 IPC 提交、在持有设备句柄的主控制循环中执行的手动挡位请求。
+pub struct ManualModeRequest {
+    pub gear: Gear,
+    pub reply: oneshot::Sender<Result<f9_core::SetGearOutcome, String>>,
+}
 
 /// 控制回路输入。`now_ms` 由调用方注入（虚拟时钟可测）。
 #[allow(dead_code)]
@@ -77,6 +85,7 @@ pub fn poll_once(inputs: LoopInputs<'_>) -> Decision {
 pub async fn handle_ipc(
     shared: &SharedHandle,
     stop_tx: &watch::Sender<bool>,
+    manual_tx: &mpsc::Sender<ManualModeRequest>,
     req: IpcRequest,
 ) -> Result<IpcResponse, f9_ipc::IpcError> {
     f9_ipc::check_request_version(&req)?;
@@ -125,7 +134,7 @@ pub async fn handle_ipc(
                     None,
                 ));
             };
-            if gear == Gear::Turbo {
+            if gear == Gear::Turbo && !s.allow_turbo {
                 return Ok(resp(
                     false,
                     Some("daemon 默认禁用 turbo（配置 allow_turbo=true 才可启用）".to_owned()),
@@ -135,13 +144,37 @@ pub async fn handle_ipc(
             if s.paused {
                 return Ok(resp(false, Some("daemon paused".to_owned()), None));
             }
-            // 写请求转交控制回路：通过 IPC 直接执行需要 device 句柄；
-            // v1 的模式是 daemon 自主控制 + CLI 的 set 经由 IPC 直通执行。
-            Ok(resp(
-                true,
-                None,
-                Some(serde_json::json!({ "requested": gear.as_str(), "async": true })),
-            ))
+            // 把请求交给唯一持有设备句柄的主控制循环，并等待写后验证结果。
+            drop(s);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            manual_tx
+                .send(ManualModeRequest {
+                    gear,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| f9_ipc::IpcError::Io("daemon control loop stopped".to_owned()))?;
+            match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+                Ok(Ok(Ok(outcome))) => Ok(resp(
+                    true,
+                    None,
+                    Some(serde_json::json!({
+                        "mode": gear.as_str(),
+                        "outcome": match outcome {
+                            f9_core::SetGearOutcome::Unchanged => "unchanged",
+                            f9_core::SetGearOutcome::Applied => "applied",
+                            f9_core::SetGearOutcome::Uncertain => "uncertain",
+                        },
+                    })),
+                )),
+                Ok(Ok(Err(error))) => Ok(resp(false, Some(error), None)),
+                Ok(Err(_)) => Ok(resp(
+                    false,
+                    Some("control loop dropped response".to_owned()),
+                    None,
+                )),
+                Err(_) => Ok(resp(false, Some("mode set timed out".to_owned()), None)),
+            }
         }
         f9_ipc::Method::Pause => {
             drop(s);
@@ -166,6 +199,7 @@ pub async fn serve_ipc(
     listener: f9_ipc::IpcListener,
     shared: SharedHandle,
     stop_tx: watch::Sender<bool>,
+    manual_tx: mpsc::Sender<ManualModeRequest>,
 ) -> Result<(), f9_ipc::IpcError> {
     #[cfg(unix)]
     {
@@ -177,9 +211,10 @@ pub async fn serve_ipc(
                     let Ok((mut stream, _)) = accepted else { continue };
                     let shared = shared.clone();
                     let stop_tx = stop_tx.clone();
+                    let manual_tx = manual_tx.clone();
                     tokio::spawn(async move {
                         while let Ok(req) = f9_ipc::socket::read_frame::<IpcRequest>(&mut stream).await {
-                            match handle_ipc(&shared, &stop_tx, req.clone()).await {
+                            match handle_ipc(&shared, &stop_tx, &manual_tx, req.clone()).await {
                                 Ok(resp) => {
                                     if f9_ipc::socket::write_frame(&mut stream, &resp).await.is_err() {
                                         break;
@@ -209,7 +244,7 @@ pub async fn serve_ipc(
     }
     #[cfg(not(unix))]
     {
-        let _ = (listener, shared, stop_tx);
+        let _ = (listener, shared, stop_tx, manual_tx);
         Err(f9_ipc::IpcError::Unsupported)
     }
 }
@@ -224,13 +259,19 @@ pub async fn step<T: Transport>(
     shared: &SharedHandle,
     now_ms: u64,
 ) -> Result<(), f9_core::DeviceError> {
-    {
+    let paused = {
         let mut s = shared.lock().await;
         s.temperature_c = temp;
         s.phase = controller.phase();
         s.transport = Some(dev.identity().kind.as_str().to_owned());
-    }
-    match controller.on_temperature(temp, now_ms) {
+        s.paused
+    };
+    let decision = if paused {
+        Decision::None
+    } else {
+        controller.on_temperature(temp, now_ms)
+    };
+    match decision {
         Decision::None => {
             // 只读轮询：读取挡位（探测/恢复判定）。
             match dev.gear().await {
@@ -289,6 +330,38 @@ pub async fn step<T: Transport>(
                 }
             }
             Ok(())
+        }
+    }
+}
+
+/// 在 daemon 主循环中执行 IPC 手动挡位请求，并把结果同步回控制器状态。
+pub async fn set_manual_mode<T: Transport>(
+    dev: &Device<T>,
+    gear: Gear,
+    controller: &mut Controller,
+    shared: &SharedHandle,
+    now_ms: u64,
+) -> Result<f9_core::SetGearOutcome, f9_core::DeviceError> {
+    controller.on_write_started();
+    match dev.set_gear(gear).await {
+        Ok(outcome) => {
+            match outcome {
+                f9_core::SetGearOutcome::Applied => controller.on_write_ok(gear, now_ms),
+                f9_core::SetGearOutcome::Unchanged => controller.on_gear_read_ok(gear),
+                f9_core::SetGearOutcome::Uncertain => controller.on_write_failed(),
+            }
+            let mut s = shared.lock().await;
+            s.gear = Some(gear);
+            if outcome == f9_core::SetGearOutcome::Applied {
+                s.last_write_at_ms = Some(now_ms);
+            }
+            s.phase = controller.phase();
+            Ok(outcome)
+        }
+        Err(error) => {
+            controller.on_write_failed();
+            shared.lock().await.phase = controller.phase();
+            Err(error)
         }
     }
 }
@@ -374,6 +447,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_keeps_polling_read_only() {
+        let sim = Arc::new(SimTransport::new(SimSpec::default(), Faults::default()));
+        let dev = Device::new_shared(sim.clone());
+        let mut c = controller();
+        c.on_connected();
+        c.on_gear_read_ok(Gear::Balanced);
+        let shared = Arc::new(Mutex::new(DaemonShared {
+            paused: true,
+            ..DaemonShared::default()
+        }));
+
+        step(&dev, Some(90.0), &mut c, &shared, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(sim.flash_write_count(), 0);
+        assert_eq!(shared.lock().await.gear, Some(Gear::Balanced));
+    }
+
+    #[tokio::test]
+    async fn manual_mode_executes_verified_device_write() {
+        let sim = Arc::new(SimTransport::new(SimSpec::default(), Faults::default()));
+        let dev = Device::new_shared(sim.clone());
+        let mut c = controller();
+        c.on_connected();
+        c.on_gear_read_ok(Gear::Balanced);
+        let shared = Arc::new(Mutex::new(DaemonShared::default()));
+
+        let outcome = set_manual_mode(&dev, Gear::Beast, &mut c, &shared, 20_000)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, f9_core::SetGearOutcome::Applied);
+        assert_eq!(sim.flash_write_count(), 1);
+        assert_eq!(shared.lock().await.gear, Some(Gear::Beast));
+    }
+
+    #[tokio::test]
     async fn degraded_after_failures_stops_writes() {
         // 连续 3 次读失败 → DegradedReadOnly；降级后不再写（SPEC §13.5/§17.2）。
         let sim = Arc::new(SimTransport::new(SimSpec::default(), Faults::default()));
@@ -430,6 +541,7 @@ mode = "beast"
     #[tokio::test]
     async fn ipc_mode_set_rejects_turbo() {
         let (tx, _rx) = watch::channel(false);
+        let (manual_tx, _manual_rx) = mpsc::channel(1);
         let shared = Arc::new(Mutex::new(DaemonShared::default()));
         let req = IpcRequest {
             protocol_version: f9_ipc::PROTOCOL_VERSION,
@@ -437,13 +549,14 @@ mode = "beast"
             method: f9_ipc::Method::ModeSet,
             gear: Some("turbo".into()),
         };
-        let resp = handle_ipc(&shared, &tx, req).await.unwrap();
+        let resp = handle_ipc(&shared, &tx, &manual_tx, req).await.unwrap();
         assert!(!resp.ok);
     }
 
     #[tokio::test]
     async fn ipc_shutdown_sets_stop() {
         let (tx, rx) = watch::channel(false);
+        let (manual_tx, _manual_rx) = mpsc::channel(1);
         let shared = Arc::new(Mutex::new(DaemonShared::default()));
         let req = IpcRequest {
             protocol_version: f9_ipc::PROTOCOL_VERSION,
@@ -451,7 +564,7 @@ mode = "beast"
             method: f9_ipc::Method::Shutdown,
             gear: None,
         };
-        let resp = handle_ipc(&shared, &tx, req).await.unwrap();
+        let resp = handle_ipc(&shared, &tx, &manual_tx, req).await.unwrap();
         assert!(resp.ok);
         assert!(*rx.borrow());
     }

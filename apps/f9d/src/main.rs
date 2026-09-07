@@ -20,7 +20,7 @@ use f9_core::control::ControlConfig;
 #[cfg(unix)]
 use f9_protocol::Gear;
 #[cfg(unix)]
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 
 mod control_loop;
 mod thermal;
@@ -135,8 +135,12 @@ async fn unix_run(
 
     tracing::info!(source = %thermal_source_name(&*thermal), "温度源已选定");
 
-    let shared: SharedHandle = Arc::new(Mutex::new(DaemonShared::default()));
-    let (stop_tx, stop_rx) = watch::channel(false);
+    let shared: SharedHandle = Arc::new(Mutex::new(DaemonShared {
+        allow_turbo: ctrl_cfg.allow_turbo,
+        ..DaemonShared::default()
+    }));
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let (manual_tx, mut manual_rx) = mpsc::channel(8);
 
     // IPC 服务（UDS 0600）。
     let socket_path = f9_ipc::default_socket_path();
@@ -151,6 +155,7 @@ async fn unix_run(
         listener,
         shared.clone(),
         stop_tx.clone(),
+        manual_tx,
     ));
 
     // 主回路。
@@ -197,9 +202,33 @@ async fn unix_run(
                 }
             }
         }
+        let Some(dev) = device.as_ref() else { break 1 };
+
+        // 手动 mode.set 与自动温控共用同一设备句柄和串行事务边界。
+        if let Ok(request) = manual_rx.try_recv() {
+            let result = control_loop::set_manual_mode(
+                dev,
+                request.gear,
+                &mut controller,
+                &shared,
+                last_write_wall,
+            )
+            .await;
+            let disconnected = matches!(result, Err(f9_core::DeviceError::Disconnected));
+            let reply = result.map_err(|e| e.to_string());
+            let _ = request.reply.send(reply);
+            if disconnected {
+                controller.on_disconnected();
+                shared.lock().await.phase = controller.phase();
+                let _ = dev.close().await;
+                device = None;
+                _lock_guard = None;
+            }
+            continue;
+        }
+
         // 控制一步。
         let temp = thermal.read_c();
-        let Some(dev) = device.as_ref() else { break 1 };
         match control_loop::step(dev, temp, &mut controller, &shared, last_write_wall).await {
             Ok(()) => {
                 shared.lock().await.phase = controller.phase();

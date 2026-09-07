@@ -1,7 +1,7 @@
 name: release
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -21,7 +21,7 @@ jobs:
             os: windows-2025
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
       - run: rustup target add ${{ matrix.target }}
@@ -46,8 +46,10 @@ jobs:
           Copy-Item target/${{ matrix.target }}/release/f9d.exe dist/
           Copy-Item README.md,README.en.md,LICENSE,NOTICE.md,CHANGELOG.md dist/
           Compress-Archive -Path dist/* -DestinationPath legion-f9-control-${{ github.ref_name }}-${{ matrix.target }}.zip
-          (Get-FileHash legion-f9-control-${{ github.ref_name }}-${{ matrix.target }}.zip -Algorithm SHA256).Hash | Out-File -Encoding ascii checksums-windows.txt
-      - uses: actions/upload-artifact@v4
+          $archive = "legion-f9-control-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Out-File -Encoding ascii checksums-windows.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: artifacts-${{ matrix.target }}
           path: |
@@ -58,32 +60,34 @@ jobs:
   sbom:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Generate SBOM (CycloneDX)
         run: |
           cargo install --locked cargo-cyclonedx || cargo install cargo-cyclonedx
           cargo cyclonedx --all --format json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: sbom
-          path: '**/*.cdx.json'
+          path: "**/*.cdx.json"
 
   release:
     needs: [build, sbom]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist-all
       - name: Verify checksums & publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat dist-all/artifacts-*/checksums*.txt >> CHECKSUMS.txt
-          # 校验：每个 artifact 的 sha256 必须匹配
-          (cd dist-all && sha256sum -c ../CHECKSUMS.txt)
+          # 下载后的 artifact 位于分目标子目录；统一生成带相对路径的校验表。
+          find dist-all -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > CHECKSUMS.txt
+          sha256sum -c CHECKSUMS.txt
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes "见 CHANGELOG.md。Windows 构建为 experimental。" \
-            dist-all/artifacts-*/*
+            CHECKSUMS.txt dist-all/artifacts-*/*.tar.gz dist-all/artifacts-*/*.zip

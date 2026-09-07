@@ -101,6 +101,26 @@ enum ModeAction {
     },
 }
 
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Devices { .. } => "devices.list",
+            Self::Status => "status",
+            Self::Info => "info",
+            Self::Mode {
+                action: ModeAction::Get,
+            } => "mode.get",
+            Self::Mode {
+                action: ModeAction::Set { .. },
+            } => "mode.set",
+            Self::Monitor { .. } => "monitor",
+            Self::Daemon { .. } => "daemon",
+            Self::Config { .. } => "config",
+            Self::Debug { .. } => "debug.raw",
+        }
+    }
+}
+
 fn gear_parser(s: &str) -> Result<Gear, String> {
     s.parse::<Gear>()
         .map_err(|_| format!("无效挡位 {s:?}（可选 quiet|balanced|beast|turbo）"))
@@ -178,7 +198,7 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(fail) => {
             if cli.output == OutputMode::Json {
-                let env = output::Envelope::err("command").with_error(
+                let env = output::Envelope::err(cli.command.name()).with_error(
                     &fail.error_code,
                     &fail.message,
                     fail.retryable,
@@ -317,7 +337,8 @@ fn raw_write_gate(p: RawParams) -> Result<RawParams, f9ctl::CommandFailure> {
         ));
     }
     // 构造与 commands::debug_raw 相同摘要所需的 Request。
-    let payload = data_bytes(p.data.as_deref().unwrap_or_default());
+    let payload = data_bytes(p.data.as_deref().unwrap_or_default())
+        .map_err(|e| f9ctl::CommandFailure::new(f9ctl::ExitCode::Usage, "invalid_input", e))?;
     let cmd = f9_protocol::Command::from_u8(p.cmd).map_err(|e| {
         f9ctl::CommandFailure::new(
             f9ctl::ExitCode::SafetyDenied,
@@ -367,11 +388,18 @@ fn raw_write_gate(p: RawParams) -> Result<RawParams, f9ctl::CommandFailure> {
     Ok(p)
 }
 
-fn data_bytes(hex_str: &str) -> Vec<u8> {
+#[allow(clippy::manual_is_multiple_of)] // 保持 workspace 声明的 Rust 1.85 MSRV。
+fn data_bytes(hex_str: &str) -> Result<Vec<u8>, String> {
     let s = hex_str.replace([',', ' '], "");
+    if s.len() % 2 != 0 {
+        return Err("十六进制数据必须包含偶数个字符".to_owned());
+    }
     (0..s.len())
         .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| format!("无效十六进制字节 {:?}", &s[i..i + 2]))
+        })
         .collect()
 }
 
@@ -391,4 +419,16 @@ fn random_word() -> String {
         .hash(&mut h);
     std::process::id().hash(&mut h);
     format!("F9{:04x}", (h.finish() & 0xffff) as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_bytes;
+
+    #[test]
+    fn raw_hex_rejects_odd_or_invalid_input_without_panicking() {
+        assert!(data_bytes("0").is_err());
+        assert!(data_bytes("zz").is_err());
+        assert_eq!(data_bytes("01, ff").unwrap(), vec![0x01, 0xff]);
+    }
 }
