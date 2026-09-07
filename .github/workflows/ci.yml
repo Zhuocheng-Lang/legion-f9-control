@@ -22,8 +22,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: install deps (libudev for bluez dbus linking)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
+      - name: install deps (libudev/libusb for hidapi, libdbus for bluez dbus linking)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: rustup toolchain install 1.98.1 --profile minimal --component clippy
       - run: cargo +1.98.1 clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: cargo test --workspace --all-features
       - run: cargo test --workspace --doc
 
@@ -57,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: rustup target add ${{ matrix.target }}
       # 编译矩阵用 check：链接真机库不必需。
       - run: cargo check --workspace --all-features --target ${{ matrix.target }}
@@ -66,6 +66,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: cargo doc --workspace --no-deps --all-features
       - name: markdown link check (simple)
         run: |
@@ -127,6 +128,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: cargo test --workspace --all-features
 
   coverage:

@@ -3,7 +3,7 @@
 all-features = true
 
 [licenses]
-version = "2"
+version = 2
 allow = [
     "MIT",
     "MIT-0",
@@ -25,7 +25,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 
 [advisories]
-version = "2"
+version = 2
 yanked = "deny"
 
 [sources]
