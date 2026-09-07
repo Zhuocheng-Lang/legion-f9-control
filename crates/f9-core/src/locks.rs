@@ -31,6 +31,7 @@ impl Drop for DeviceLock {
         #[cfg(unix)]
         {
             use rustix::fs::{FlockOperation, flock};
+            use std::os::unix::io::AsFd;
             // Drop 不能返回错误；释放 advisory 锁失败时静默忽略（进程退出亦会释放）。
             let _ = flock(self.file.as_fd(), FlockOperation::Unlock);
         }
@@ -42,6 +43,7 @@ impl Drop for DeviceLock {
 #[cfg(unix)]
 fn acquire(file: &std::fs::File) -> Result<(), LockError> {
     use rustix::fs::{FlockOperation, flock};
+    use std::os::unix::io::AsFd;
     // 非阻塞独占锁：已被其他进程持有时立即返回 Busy，不等待。
     flock(file.as_fd(), FlockOperation::NonBlockingLockExclusive).map_err(|_| LockError::Busy)
 }
