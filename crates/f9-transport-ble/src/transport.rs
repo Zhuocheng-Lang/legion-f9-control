@@ -9,7 +9,7 @@ use f9_protocol::{Request, Response};
 use f9_transport::{ExchangePolicy, Transport, TransportError, TransportIdentity};
 
 #[cfg(target_os = "linux")]
-mod linux_impl;
+pub(crate) mod linux_impl;
 
 /// 通知队列容量常量的纯逻辑测试可在任何平台运行。
 pub struct QueueStats {
@@ -83,7 +83,7 @@ impl Transport for BleTransport {
             let Some(inner) = self.inner.as_ref() else {
                 return Err(TransportError::Disconnected);
             };
-            let buf = frame::encode(&request)?;
+            let buf = f9_protocol::ble::encode(&request)?;
             // 会话命令 fire-and-forget：写即返回，不等待通知（confirmed）。
             if request.command.is_session_command() {
                 inner.write_with_response(&buf).await?;
@@ -105,7 +105,7 @@ impl Transport for BleTransport {
                 }
                 match tokio::time::timeout(remaining, inner.notify_rx.lock().await.recv()).await {
                     Ok(Some(n)) => {
-                        match frame::decode(&request, &n) {
+                        match f9_protocol::ble::decode(&request, &n) {
                             Ok(resp) => return Ok(resp),
                             Err(f9_protocol::ProtocolError::CommandMismatch { .. })
                             | Err(f9_protocol::ProtocolError::OffsetMismatch { .. }) => {

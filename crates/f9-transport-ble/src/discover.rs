@@ -5,7 +5,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use btleplug::api::{Central, Manager, Peripheral as _, ScanFilter};
+use btleplug::api::{Central, Manager, ScanFilter};
 use btleplug::platform::{Adapter, Manager as PlatformManager};
 use f9_protocol::ids::BLE_SERVICE_UUID;
 use f9_transport::{Capability, DeviceCandidate, TransportError, TransportKind};
@@ -52,13 +52,13 @@ async fn central_adapter(manager: &btleplug::platform::Manager) -> Result<Adapte
 async fn scan_peripherals(
     timeout: Duration,
 ) -> Result<(Vec<btleplug::platform::Peripheral>, Adapter), TransportError> {
-    let manager = PlatformManager::default()
+    let manager = PlatformManager::new()
         .await
         .map_err(|e| TransportError::Internal(format!("ble manager: {e}")))?;
     let adapter = central_adapter(&manager).await?;
     adapter
         .start_scan(ScanFilter {
-            services: vec![btleplug::api::Uuid::from_str(BLE_SERVICE_UUID).expect("valid uuid")],
+            services: vec![uuid::Uuid::from_str(BLE_SERVICE_UUID).expect("valid uuid")],
         })
         .await
         .map_err(|e| TransportError::Internal(format!("ble scan: {e}")))?;

@@ -4,9 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use btleplug::api::{
-    Central, CharPropFlags, Characteristic, Manager, Peripheral as _, ScanFilter, WriteType,
-};
+use btleplug::api::{CharPropFlags, Characteristic, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::Adapter;
 use f9_protocol::ids::{BLE_NOTIFY_UUID, BLE_SERVICE_UUID, BLE_WRITE_UUID};
 use tokio::sync::{Mutex, mpsc};
@@ -28,8 +26,8 @@ pub(crate) struct LinuxBle {
     pub queue_overflow: Arc<AtomicU64>,
 }
 
-fn uuid(s: &str) -> btleplug::api::Uuid {
-    btleplug::api::Uuid::from_str(s).expect("valid uuid constant")
+fn uuid(s: &str) -> uuid::Uuid {
+    uuid::Uuid::from_str(s).expect("valid uuid constant")
 }
 
 impl LinuxBle {
@@ -43,7 +41,7 @@ impl LinuxBle {
             .await
             .map_err(|e| f9_transport::TransportError::Internal(format!("ble connect: {e}")))?;
         peripheral
-            .discover_characteristics()
+            .discover_services()
             .await
             .map_err(|e| f9_transport::TransportError::Internal(format!("ble discover: {e}")))?;
         let chars = peripheral.characteristics();
@@ -58,11 +56,11 @@ impl LinuxBle {
             .ok_or(f9_transport::TransportError::Unsupported)?
             .clone();
         // 写特征必须声明 write 能力；不静默降级为未验证写法。
-        if !write_char.properties.write {
+        if !write_char.properties.contains(CharPropFlags::WRITE) {
             return Err(f9_transport::TransportError::Unsupported);
         }
         peripheral
-            .subscribe(notify_char.uuid)
+            .subscribe(&notify_char)
             .await
             .map_err(|e| f9_transport::TransportError::Internal(format!("ble subscribe: {e}")))?;
         let overflow = Arc::new(AtomicU64::new(0));
@@ -96,13 +94,13 @@ impl LinuxBle {
         buf: &[u8],
     ) -> Result<(), f9_transport::TransportError> {
         self.peripheral
-            .write(self.write_char, buf, WriteType::WithResponse)
+            .write(&self.write_char, buf, WriteType::WithResponse)
             .await
             .map_err(|e| f9_transport::TransportError::Internal(format!("ble write: {e}")))
     }
 
     pub async fn disconnect(&self) {
-        let _ = self.peripheral.unsubscribe(self.notify_char.uuid).await;
+        let _ = self.peripheral.unsubscribe(&self.notify_char).await;
         let _ = self.peripheral.disconnect().await;
     }
 }
@@ -124,7 +122,7 @@ pub fn scan_filter() -> ScanFilter {
 
 /// 检查外设是否广播目标服务 UUID 或名称（服务 UUID 优先，名称辅助）。
 pub async fn matches_target(p: &btleplug::platform::Peripheral) -> bool {
-    let Ok(props) = p.properties().await else {
+    let Ok(Some(props)) = p.properties().await else {
         return false;
     };
     let service_match = props
