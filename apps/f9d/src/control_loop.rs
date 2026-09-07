@@ -203,7 +203,6 @@ pub async fn serve_ipc(
 ) -> Result<(), f9_ipc::IpcError> {
     #[cfg(unix)]
     {
-        use tokio::io::AsyncWriteExt;
         let mut stop_rx = stop_tx.subscribe();
         loop {
             tokio::select! {

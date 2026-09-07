@@ -18,8 +18,6 @@ use f9_core::config::DaemonConfig;
 #[cfg(unix)]
 use f9_core::control::ControlConfig;
 #[cfg(unix)]
-use f9_protocol::Gear;
-#[cfg(unix)]
 use tokio::sync::{Mutex, mpsc, watch};
 
 mod control_loop;
@@ -270,7 +268,7 @@ async fn unix_run(
         let mut s = shared.lock().await;
         s.phase = f9_core::control::DaemonPhase::Stopped;
     }
-    let _ = ipc_task.abort();
+    ipc_task.abort();
     let _ = std::fs::remove_file(&socket_path);
     result
 }
@@ -301,10 +299,10 @@ async fn open_transport(
         )),
         _ => {
             // auto：USB 优先，其次 BLE。
-            if let Ok(list) = f9_transport_usb::discover_usb() {
-                if let Some(t) = list.into_iter().next() {
-                    return Ok(Arc::new(t) as Arc<dyn f9_transport::Transport>);
-                }
+            if let Ok(list) = f9_transport_usb::discover_usb()
+                && let Some(t) = list.into_iter().next()
+            {
+                return Ok(Arc::new(t) as Arc<dyn f9_transport::Transport>);
             }
             Ok(Arc::new(
                 f9_transport_ble::discover::connect_first(Duration::from_secs(4)).await?,

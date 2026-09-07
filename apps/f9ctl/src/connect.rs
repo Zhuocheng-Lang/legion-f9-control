@@ -130,7 +130,7 @@ pub async fn connect_direct(
                         f9_transport_ble::discover::connect_first(Duration::from_secs(4)).await?,
                     ));
                 }
-                return Err(TransportError::Disconnected);
+                Err(TransportError::Disconnected)
             }
             #[cfg(not(target_os = "linux"))]
             {
