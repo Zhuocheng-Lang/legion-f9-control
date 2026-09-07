@@ -160,10 +160,9 @@ mod tests {
         assert!(cap > 0);
     }
     #[tokio::test]
+    #[cfg(not(target_os = "linux"))]
     async fn unsupported_platform_returns_unsupported() {
-        if crate::SUPPORTED_PLATFORM {
-            return; // Linux 上没有占位实例可测，跳过。
-        }
+        // 非 Linux 平台才有占位构造（Linux 上 BleTransport::unsupported 不存在）。
         let t = BleTransport::unsupported();
         let req = Request::read(Command::LiveStatus, 0, 3).unwrap();
         let err = t

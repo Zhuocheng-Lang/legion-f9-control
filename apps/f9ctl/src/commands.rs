@@ -388,7 +388,7 @@ pub async fn daemon(
                 std::fs::write(&unit_path, unit).map_err(|e| {
                     CommandFailure::new(ExitCode::Permission, "install_failed", e.to_string())
                 })?;
-                let _ = Proc::new("systemctl")
+                let _ = std::process::Command::new("systemctl")
                     .args(["--user", "daemon-reload"])
                     .status();
                 let env = ctx.envelope_ok(&command).with_data(serde_json::json!({
@@ -398,7 +398,7 @@ pub async fn daemon(
             }
             crate::commands::DaemonAction::Uninstall => {
                 let _ = std::fs::remove_file(&unit_path);
-                let _ = Proc::new("systemctl")
+                let _ = std::process::Command::new("systemctl")
                     .args(["--user", "daemon-reload"])
                     .status();
                 let env = ctx.envelope_ok(&command);
@@ -413,7 +413,7 @@ pub async fn daemon(
                     crate::commands::DaemonAction::Restart => "restart",
                     _ => unreachable!(),
                 };
-                let status = Proc::new("systemctl")
+                let status = std::process::Command::new("systemctl")
                     .args(["--user", verb, "f9d.service"])
                     .status()
                     .map_err(|e| {
@@ -426,7 +426,7 @@ pub async fn daemon(
                 Ok((status.code().unwrap_or(1), vec![ctx.envelope_ok(&command)]))
             }
             crate::commands::DaemonAction::Status => {
-                let out = Proc::new("systemctl")
+                let out = std::process::Command::new("systemctl")
                     .args(["--user", "is-active", "f9d.service"])
                     .output()
                     .map_err(|e| {
@@ -443,7 +443,7 @@ pub async fn daemon(
                 Ok((0, vec![env]))
             }
             crate::commands::DaemonAction::Logs => {
-                let status = Proc::new("journalctl")
+                let status = std::process::Command::new("journalctl")
                     .args(["--user", "-u", "f9d.service", "-n", "100", "--no-pager"])
                     .status()
                     .map_err(|e| {

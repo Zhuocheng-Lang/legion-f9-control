@@ -2,6 +2,9 @@
 
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+
 use f9_transport::{DeviceCandidate, Transport, TransportError, TransportKind};
 
 use crate::output::OutputMode;

@@ -131,6 +131,7 @@ async fn unix_run(
     ctrl_cfg: ControlConfig,
     poll: Duration,
 ) -> i32 {
+    use control_loop::{DaemonShared, SharedHandle};
     use f9_transport::Transport;
 
     tracing::info!(source = %thermal_source_name(&*thermal), "温度源已选定");
