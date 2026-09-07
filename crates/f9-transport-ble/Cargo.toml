@@ -15,7 +15,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-btleplug = "0.11"
+btleplug = "0.13"
 uuid = { version = "1", features = ["v4"] }
 tokio-stream = "0.1"
 
