@@ -8,10 +8,10 @@ mapfile -t files < <(git ls-files -z | tr '\0' '\n')
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
   case "$f" in
-    *.exe|*.dll|*.bin|*.gpr|*.rep|*.pcap|*.pcapng)
-      echo "FORBIDDEN EXTENSION: $f" >&2
-      fail=1
-      ;;
+  *.exe | *.dll | *.bin | *.gpr | *.rep | *.pcap | *.pcapng)
+    echo "FORBIDDEN EXTENSION: $f" >&2
+    fail=1
+    ;;
   esac
 done
 
