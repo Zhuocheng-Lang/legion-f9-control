@@ -207,7 +207,6 @@ mod tests {
         let path = dir.path().join("v.sock");
         let listener = listen(&path).unwrap();
         let server = tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
             let (mut sock, _) = listener.accept().await.unwrap();
             let req: IpcRequest = read_frame(&mut sock).await.unwrap();
             let err = match check_request_version(&req) {

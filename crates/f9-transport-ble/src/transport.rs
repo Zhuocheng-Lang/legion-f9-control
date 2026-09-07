@@ -147,10 +147,7 @@ impl Transport for BleTransport {
 /// 通知通道容量检查（纯逻辑，所有平台可测）。
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::NOTIFY_QUEUE_CAPACITY;
-    use f9_protocol::Command;
-    use std::time::Duration;
 
     #[test]
     fn queue_capacity_is_bounded() {
@@ -159,10 +156,14 @@ mod tests {
         let cap: usize = NOTIFY_QUEUE_CAPACITY;
         assert!(cap > 0);
     }
-    #[tokio::test]
     #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
     async fn unsupported_platform_returns_unsupported() {
         // 非 Linux 平台才有占位构造（Linux 上 BleTransport::unsupported 不存在）。
+        use super::{BleTransport, ExchangePolicy, TransportError};
+        use f9_protocol::{Command, Request};
+        use std::time::Duration;
+
         let t = BleTransport::unsupported();
         let req = Request::read(Command::LiveStatus, 0, 3).unwrap();
         let err = t
