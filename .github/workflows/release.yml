@@ -21,7 +21,7 @@ jobs:
             os: windows-2025
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: rustup target add ${{ matrix.target }}
@@ -60,7 +60,7 @@ jobs:
   sbom:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Generate SBOM (CycloneDX)
         run: |
           cargo install --locked cargo-cyclonedx || cargo install cargo-cyclonedx
@@ -74,7 +74,7 @@ jobs:
     needs: [build, sbom]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist-all

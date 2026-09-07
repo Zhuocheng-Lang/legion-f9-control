@@ -14,14 +14,14 @@ jobs:
   fmt:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt
       - run: cargo +1.98.1 fmt --check
 
   clippy:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: install deps (libudev/libusb for hidapi, libdbus for bluez dbus linking)
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: rustup toolchain install 1.98.1 --profile minimal --component clippy
@@ -30,7 +30,7 @@ jobs:
   test-linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: cargo test --workspace --all-features
       - run: cargo test --workspace --doc
@@ -38,7 +38,7 @@ jobs:
   test-windows:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: cargo test --workspace --all-features
 
   build-matrix:
@@ -55,7 +55,7 @@ jobs:
             os: windows-2025
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: rustup target add ${{ matrix.target }}
@@ -65,7 +65,7 @@ jobs:
   docs:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: cargo doc --workspace --no-deps --all-features
       - name: markdown link check (simple)
@@ -92,7 +92,7 @@ jobs:
   deny:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6
         with:
           tool: cargo-deny
@@ -116,7 +116,7 @@ jobs:
   hygiene:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - name: secret scan（新增历史）
@@ -127,7 +127,7 @@ jobs:
   json-schema-compat:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libdbus-1-dev pkg-config
       - run: cargo test --workspace --all-features
 
@@ -136,7 +136,7 @@ jobs:
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6
