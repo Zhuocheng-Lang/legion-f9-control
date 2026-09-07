@@ -160,8 +160,9 @@ mod tests {
     #[tokio::test]
     async fn unsupported_platform_returns_unsupported() {
         // 非 Linux 平台才有占位构造（Linux 上 BleTransport::unsupported 不存在）。
-        use super::{BleTransport, ExchangePolicy, TransportError};
+        use super::{BleTransport, TransportError};
         use f9_protocol::{Command, Request};
+        use f9_transport::Transport;
         use std::time::Duration;
 
         let t = BleTransport::unsupported();
