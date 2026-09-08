@@ -119,4 +119,5 @@ f9ctl debug raw --cmd 0x06 --length 15 --data "..." --unsafe-write
 
 ## 许可证
 
-[MIT](LICENSE)。另见 [NOTICE.md](NOTICE.md)（非官方声明与商标说明）。
+本项目按 [MPL-2.0](LICENSE)（Mozilla Public License 2.0）发布：修改本项目的源码文件须以同一许可证共享，
+但可自由集成到更大的作品（含闭源）。另见 [NOTICE.md](NOTICE.md)（非官方声明与商标说明）。

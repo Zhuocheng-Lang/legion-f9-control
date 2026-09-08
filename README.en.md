@@ -112,5 +112,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `cargo fmt --check`,
 
 ## License
 
-[MIT](LICENSE). See also [NOTICE.md](NOTICE.md) for the unofficial-project and
-trademark notice.
+Distributed under the [MPL-2.0](LICENSE) (Mozilla Public License 2.0): modifications to
+this project's source files must be shared under the same license, while integration
+into larger works (including proprietary ones) remains free. See also [NOTICE.md](NOTICE.md)
+for the unofficial-project and trademark notice.

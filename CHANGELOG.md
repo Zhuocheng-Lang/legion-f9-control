@@ -22,6 +22,11 @@
 - CI 门禁：fmt、clippy -D warnings、测试矩阵（Linux x86_64/aarch64、Windows
   x86_64 experimental）、cargo-deny、RustSec、secret scan、禁止文件/大文件检查。
 
+### Changed
+
+- 许可证由 MIT 变更为 MPL-2.0（Mozilla Public License 2.0）：修改本项目源码文件须以
+  同一许可证共享，可自由集成到更大的作品；项目尚未发布任何版本，无历史许可兼容负担。
+
 ### 兼容性说明
 
 - 全新实现，不兼容任何旧版 CLI/配置/输出格式；

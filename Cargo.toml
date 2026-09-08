@@ -17,7 +17,7 @@ members = [
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT"
+license = "MPL-2.0"
 repository = "https://github.com/Zhuocheng-Lang/legion-f9-control"
 readme = "README.md"
 
