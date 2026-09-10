@@ -38,8 +38,13 @@ pub fn encode(req: &Request) -> Result<[u8; BLE_FRAME_LEN], ProtocolError> {
 }
 
 /// 解码 BLE 响应帧。匹配帧头、command、length 与 offset（confirmed）。
+///
+/// 真机实测（2026-09-10）：通知为变长帧 —— 头部 5 字节 + 实际携带的数据字节，
+/// 不足 declared 的尾部隐含为 0（如 LiveStatus 读 6 字节仅回 3 字节数据）。
+/// 旧实现要求固定 20 字节帧，导致每个读命令都报 ShortFrame。
 pub fn decode(req: &Request, buf: &[u8]) -> Result<Response, ProtocolError> {
-    if buf.len() < BLE_FRAME_LEN {
+    // 头部 5 字节：header + cmd + length + offset(2)。
+    if buf.len() < 5 {
         return Err(ProtocolError::ShortFrame {
             expected: BLE_FRAME_LEN,
             got: buf.len(),
@@ -74,16 +79,20 @@ pub fn decode(req: &Request, buf: &[u8]) -> Result<Response, ProtocolError> {
         });
     }
     // 数据区在 buf[5..5+declared]；声明长度超过帧容量视为短包。
-    if 5 + declared > buf.len() {
+    if 5 + declared > BLE_FRAME_LEN {
         return Err(ProtocolError::ShortData {
             declared,
-            got: buf.len() - 5,
+            got: BLE_FRAME_LEN - 5,
         });
     }
+    // 通知变长：不足 declared 的尾部补零（真机行为：隐含 0）。
+    let mut data = vec![0u8; declared];
+    let carried = (buf.len() - 5).min(declared);
+    data[..carried].copy_from_slice(&buf[5..5 + carried]);
     Ok(Response {
         command: req.command,
         offset,
-        data: buf[5..5 + declared].to_vec(),
+        data,
     })
 }
 
