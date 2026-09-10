@@ -97,7 +97,16 @@ impl LinuxBle {
         self.peripheral
             .write(&self.write_char, buf, WriteType::WithResponse)
             .await
-            .map_err(|e| f9_transport::TransportError::Internal(format!("ble write: {e}")))
+            .map_err(|e| {
+                // btleplug 在连接失效时返回 btleplug::Error::NotConnected("Not connected")；
+                // 映射为 Disconnected，让 daemon 断线重连逻辑接管
+                // （真机实测：回插 USB 后 BLE 广播停止，旧连接失效）。
+                if matches!(e, btleplug::Error::NotConnected) {
+                    f9_transport::TransportError::Disconnected
+                } else {
+                    f9_transport::TransportError::Internal(format!("ble write: {e}"))
+                }
+            })
     }
 
     pub async fn disconnect(&self) {
