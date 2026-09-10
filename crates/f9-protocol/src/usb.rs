@@ -10,7 +10,6 @@
 //! [8:64]  = payload/data
 //! ```
 
-use crate::command::Command;
 use crate::error::{ProtocolError, ResponseStatus};
 use crate::{Request, Response, USB_FRAME_LEN, USB_MAX_PAYLOAD, USB_REPORT_ID};
 
@@ -39,8 +38,23 @@ pub fn encode(req: &Request) -> Result<[u8; USB_FRAME_LEN], ProtocolError> {
     Ok(frame)
 }
 
+/// 请求帧头校验和（对同布局 64 字节请求帧计算：sum(bytes[3..63]) & 0xffff）。
+/// 设备在响应 [1:3] 中回显该值（真机实测），响应内容本身不参与校验。
+fn request_checksum(req: &Request) -> u16 {
+    let mut frame = [0u8; USB_FRAME_LEN];
+    frame[3] = req.command.as_u8();
+    frame[4] = req.length;
+    frame[5..7].copy_from_slice(&req.offset.to_le_bytes());
+    let end = (8 + req.payload.len()).min(USB_FRAME_LEN);
+    frame[8..end].copy_from_slice(&req.payload[..end - 8]);
+    (frame[3..63].iter().map(|b| u32::from(*b)).sum::<u32>() & 0xffff) as u16
+}
+
 /// 解码 USB 响应帧。检查长度、report ID、command 回显、校验和与状态。
-pub fn decode(req_cmd: Command, buf: &[u8]) -> Result<Response, ProtocolError> {
+///
+/// `req` 是产生本响应的原始请求：设备在响应 [1:3] 回显**请求帧**校验和
+/// （真机实测，覆盖请求 cmd/length/offset/payload），响应用它做完整性验证。
+pub fn decode(req: &Request, buf: &[u8]) -> Result<Response, ProtocolError> {
     if buf.len() < USB_FRAME_LEN {
         return Err(ProtocolError::ShortFrame {
             expected: USB_FRAME_LEN,
@@ -60,18 +74,18 @@ pub fn decode(req_cmd: Command, buf: &[u8]) -> Result<Response, ProtocolError> {
         });
     }
     let echo = buf[3];
-    let expected_cmd = req_cmd.as_u8();
+    let expected_cmd = req.command.as_u8();
     if echo != expected_cmd {
         return Err(ProtocolError::CommandMismatch {
             expected: expected_cmd,
             got: echo,
         });
     }
-    let sum: u32 = buf[3..63].iter().map(|b| u32::from(*b)).sum();
-    let expected_sum = ((sum & 0xffff) as u16).to_le_bytes();
-    if buf[1..3] != expected_sum {
+    // 真机实测（2026-09-10）：响应 [1:3] = 请求帧校验和的回显（含请求 payload）。
+    let echo_sum = request_checksum(req);
+    if buf[1..3] != echo_sum.to_le_bytes() {
         return Err(ProtocolError::BadChecksum {
-            expected: u16::from_le_bytes(expected_sum),
+            expected: echo_sum,
             got: u16::from_le_bytes([buf[1], buf[2]]),
         });
     }
@@ -97,7 +111,7 @@ pub fn decode(req_cmd: Command, buf: &[u8]) -> Result<Response, ProtocolError> {
     }
     let offset = u16::from_le_bytes([buf[5], buf[6]]);
     Ok(Response {
-        command: req_cmd,
+        command: req.command,
         offset,
         data: buf[8..data_end].to_vec(),
     })
@@ -151,18 +165,19 @@ mod tests {
             *b = (i as u8).wrapping_mul(7);
         }
         resp[0] = 0x04;
-        let sum: u32 = resp[3..63].iter().map(|b| u32::from(*b)).sum();
-        resp[1..3].copy_from_slice(&((sum & 0xffff) as u16).to_le_bytes());
-        let out = decode(Command::SettingsRead, &resp).unwrap();
+        // 设备在响应 [1:3] 回显请求帧校验和（不重算响应内容）。
+        resp[1..3].copy_from_slice(&req_frame_checksum(&req).to_le_bytes());
+        let out = decode(&req, &resp).unwrap();
         assert_eq!(out.command, Command::SettingsRead);
         assert_eq!(out.data.len(), 15);
     }
 
     #[test]
     fn decode_rejects_short_frame() {
+        let req = read_req(Command::LiveStatus, 0, 3);
         let short = vec![0u8; 32];
         assert!(matches!(
-            decode(Command::LiveStatus, &short),
+            decode(&req, &short),
             Err(ProtocolError::ShortFrame {
                 expected: 64,
                 got: 32
@@ -176,7 +191,7 @@ mod tests {
         let mut frame = encode(&req).unwrap();
         frame[0] = 0x05;
         assert!(matches!(
-            decode(Command::LiveStatus, &frame),
+            decode(&req, &frame),
             Err(ProtocolError::BadReportId { got: 0x05, .. })
         ));
     }
@@ -187,7 +202,7 @@ mod tests {
         let mut frame = encode(&req).unwrap();
         frame[3] = 0x99;
         assert!(matches!(
-            decode(Command::LiveStatus, &frame),
+            decode(&req, &frame),
             Err(ProtocolError::CommandMismatch { got: 0x99, .. })
         ));
     }
@@ -198,7 +213,7 @@ mod tests {
         let mut frame = encode(&req).unwrap();
         frame[1] ^= 0xff;
         assert!(matches!(
-            decode(Command::LiveStatus, &frame),
+            decode(&req, &frame),
             Err(ProtocolError::BadChecksum { .. })
         ));
     }
@@ -209,36 +224,54 @@ mod tests {
         let patch = |status: u8| {
             let mut frame = encode(&req).unwrap();
             frame[7] = status;
-            let sum: u32 = frame[3..63].iter().map(|b| u32::from(*b)).sum();
-            frame[1..3].copy_from_slice(&((sum & 0xffff) as u16).to_le_bytes());
+            // 响应 [1:3] = 请求校验和回显。
+            frame[1..3].copy_from_slice(&req_frame_checksum(&req).to_le_bytes());
             frame
         };
         assert_eq!(
-            decode(Command::LiveStatus, &patch(0xfe)).unwrap_err(),
+            decode(&req, &patch(0xfe)).unwrap_err(),
             ProtocolError::DeviceBusy
         );
         assert_eq!(
-            decode(Command::LiveStatus, &patch(0xff)).unwrap_err(),
+            decode(&req, &patch(0xff)).unwrap_err(),
             ProtocolError::DeviceError
         );
         let frame = patch(0x42);
         assert!(matches!(
-            decode(Command::LiveStatus, &frame),
+            decode(&req, &frame),
             Err(ProtocolError::BadStatus(0x42))
         ));
     }
 
     #[test]
     fn decode_rejects_declared_length_beyond_capacity() {
-        let req = read_req(Command::LiveStatus, 0, 3);
-        let mut frame = encode(&req).unwrap();
+        // 响应帧头声明 length=0xff：校验和按“请求 length=0xff、无 payload”自洽，
+        // 使 decode 走到长度检查；再验证超容量声明被拒。
+        let mut frame = encode(&read_req(Command::LiveStatus, 0, 3)).unwrap();
         frame[4] = 0xff;
-        // 校验和必须有效才能到达长度检查。
-        let sum: u32 = frame[3..63].iter().map(|b| u32::from(*b)).sum();
-        frame[1..3].copy_from_slice(&((sum & 0xffff) as u16).to_le_bytes());
+        let sum = request_checksum(&Request {
+            command: Command::LiveStatus,
+            offset: 0,
+            length: 0xff,
+            payload: vec![],
+        });
+        frame[1..3].copy_from_slice(&sum.to_le_bytes());
+        // decode 的校验和按传入请求重算；传入同头请求（length=0xff）保持自洽。
+        let fake_req = Request {
+            command: Command::LiveStatus,
+            offset: 0,
+            length: 0xff,
+            payload: vec![],
+        };
         assert!(matches!(
-            decode(Command::LiveStatus, &frame),
+            decode(&fake_req, &frame),
             Err(ProtocolError::ShortData { .. })
         ));
+    }
+
+    /// 请求帧校验和（测试辅助：等价于 encode 后读 [1:3]）。
+    fn req_frame_checksum(req: &Request) -> u16 {
+        let f = encode(req).unwrap();
+        u16::from_le_bytes([f[1], f[2]])
     }
 }

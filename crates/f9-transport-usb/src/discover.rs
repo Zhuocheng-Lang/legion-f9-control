@@ -24,11 +24,17 @@ pub fn list_usb_candidates() -> Result<Vec<UsbCandidate>, f9_transport::Transpor
     let api = hidapi::HidApi::new()
         .map_err(|e| f9_transport::TransportError::Internal(format!("hid: {e}")))?;
     let mut out = Vec::new();
+    // hidapi 的 linux 原生后端为 descriptor 中的每个 usage 生成一条 DeviceInfo，
+    // 同一 devnode 会重复出现；同一物理设备按路径去重。
+    let mut seen = std::collections::HashSet::new();
     for info in api.device_list() {
         if info.vendor_id() != USB_VID || info.product_id() != USB_PID {
             continue;
         }
         let path = info.path();
+        if !seen.insert(path.to_owned()) {
+            continue;
+        }
         let sysfs_ok = matches!(
             descriptor_check(path),
             DescriptorCheck::Ok | DescriptorCheck::UnknownBackend
@@ -211,7 +217,7 @@ fn probe_report4(
     if n == 0 {
         return Ok(false);
     }
-    Ok(f9_protocol::usb::decode(req.command, &resp[..n]).is_ok())
+    Ok(f9_protocol::usb::decode(&req, &resp[..n]).is_ok())
 }
 
 /// 非支持平台的占位（保持 API 形状一致）。

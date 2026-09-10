@@ -10,11 +10,17 @@ Type=simple
 ExecStart=@BINDIR@/f9d run
 Restart=on-failure
 RestartSec=5
+# IPC socket 目录由 systemd 创建/清理（user manager 下 %t = /run/user/<uid>）。
+RuntimeDirectory=legion-f9-control
+RuntimeDirectoryMode=0700
 # 仅本用户；不提权。
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
+# ProtectHome=read-only 会连带把 /run/user/<uid> 变只读（user manager 实测），
+# 导致 IPC socket 无法创建；runtime 目录用上面 RuntimeDirectory 授权写入。
 ProtectHome=read-only
+ReadWritePaths=%t/legion-f9-control
 
 [Install]
 WantedBy=default.target

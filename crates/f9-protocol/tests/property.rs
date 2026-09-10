@@ -41,14 +41,14 @@ proptest! {
     }
 
     #[test]
-    fn usb_decode_never_panics(cmd in arb_command(), buf in proptest::collection::vec(any::<u8>(), 0..=80)) {
-        let _ = usb::decode(cmd, &buf);
+    fn usb_decode_never_panics(req in arb_request(), buf in proptest::collection::vec(any::<u8>(), 0..=80)) {
+        let _ = usb::decode(&req, &buf);
     }
 
     #[test]
     fn usb_roundtrip(req in arb_request()) {
         if let Ok(frame) = usb::encode(&req)
-            && let Ok(resp) = usb::decode(req.command, &frame)
+            && let Ok(resp) = usb::decode(&req, &frame)
         {
             prop_assert_eq!(resp.command, req.command);
             prop_assert_eq!(resp.offset, req.offset);

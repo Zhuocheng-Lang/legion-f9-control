@@ -42,6 +42,11 @@ impl UsbTransport {
             return Err(TransportError::Unsupported);
         }
         let device = api.open_path(path).map_err(hid_err)?;
+        // 排空上一次会话残留的数据：设备会主动推送 report 3 短通知，
+        // 且重连瞬间可能还有未读帧；不排空会污染第一次交换（真机实测：
+        // 拔插后首个 exchange 读到 3 字节旧通知 → ShortFrame）。
+        let mut discard = [0u8; 256];
+        while device.read_timeout(&mut discard, 20).unwrap_or(0) > 0 {}
         Ok(Self {
             identity: TransportIdentity {
                 kind: f9_transport::TransportKind::Usb,
@@ -119,6 +124,11 @@ fn hid_err(e: hidapi::HidError) -> TransportError {
     match e {
         hidapi::HidError::OpenHidDeviceWithDeviceInfoError { .. } => TransportError::Disconnected,
         hidapi::HidError::IoError { .. } => TransportError::Disconnected,
+        // hidraw 后端：设备拔出时读/写返回 HidApiError（ENODEV / "No such device"）。
+        // 映射为 Disconnected，让上层退避重连逻辑接管（真机实测 2026-09-10）。
+        hidapi::HidError::HidApiError { .. } | hidapi::HidError::HidApiErrorEmpty => {
+            TransportError::Disconnected
+        }
         _ => TransportError::Internal(format!("hid: {e}")),
     }
 }
@@ -159,15 +169,35 @@ impl Transport for UsbTransport {
                     }
                     Ok(())
                 })?;
-                // 读：带超时。
+                // 读：带超时；跳过设备主动推送的 report 3 短通知与残帧。
+                // 设备随时可能推送 3 字节通知（PROTOCOL.md §1），若恰好
+                // 夹在请求-响应之间，直接把短帧当结果会误报协议违规
+                // （真机实测：拔插重连后首个交换必现）。
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(read_ms.max(0) as u64);
                 let mut buf = [0u8; f9_protocol::USB_FRAME_LEN];
-                let n = with_handle(&handle, |d| {
-                    d.read_timeout(&mut buf, read_ms).map_err(hid_err)
-                })?;
+                let n = loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break 0usize;
+                    }
+                    let n = with_handle(&handle, |d| {
+                        d.read_timeout(&mut buf, remaining.as_millis().min(i32::MAX as u128) as i32)
+                            .map_err(hid_err)
+                    })?;
+                    if n == f9_protocol::USB_FRAME_LEN {
+                        break n;
+                    }
+                    if n == 0 {
+                        break 0usize;
+                    }
+                    // 短帧：非目标数据（通知/残帧），丢弃继续等真正的响应。
+                    tracing::debug!(transport = "usb", dropped_short = n, "跳过非响应短帧");
+                };
                 if n == 0 {
                     return Err(TransportError::Timeout);
                 }
-                frame::decode(request.command, &buf[..n]).map_err(TransportError::Protocol)
+                frame::decode(&request, &buf[..n]).map_err(TransportError::Protocol)
             })
             .await;
             match res {

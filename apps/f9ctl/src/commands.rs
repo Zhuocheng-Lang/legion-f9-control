@@ -336,6 +336,10 @@ pub async fn monitor(
 
                 // 原 transport 已失效：释放其设备锁并重新执行发现/选择。
                 drop(locked.take());
+                // 重连初期设备可能仍在上电复位，交换可能短暂报
+                // Protocol（短帧/校验抖动）或 Timeout：有限重试而不是退出
+                // （真机实测：拔插后首帧可能撞上未排空的旧通知帧）。
+                let mut recovery_errors = 0u32;
                 loop {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     match direct_transport(ctx).await {
@@ -346,7 +350,17 @@ pub async fn monitor(
                             }
                             break;
                         }
-                        Err(e) if matches!(e.code, ExitCode::NoDevice | ExitCode::Timeout) => {}
+                        Err(e)
+                            if matches!(
+                                e.code,
+                                ExitCode::NoDevice | ExitCode::Timeout | ExitCode::Protocol
+                            ) =>
+                        {
+                            recovery_errors += 1;
+                            if recovery_errors > 20 {
+                                return Err(e);
+                            }
+                        }
                         Err(e) => return Err(e),
                     }
                 }
