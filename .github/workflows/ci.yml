@@ -93,12 +93,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908
         with:
           tool: cargo-deny
       - run: cargo deny check licenses bans sources
       - name: cargo audit (RustSec；工具故障与漏洞发现需区分)
-        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908
         with:
           tool: cargo-audit
       - run: |
@@ -139,7 +139,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908
         with:
           tool: cargo-llvm-cov
       - name: Run coverage
