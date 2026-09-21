@@ -1,0 +1,13 @@
+.{
+    .name = .legion_f9_control,
+    .version = "0.0.0", // 移植中；与旧实现（1.0.0）功能对齐后再跟版本
+    .fingerprint = 0x36c22d9dd3682c26,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+    },
+}
