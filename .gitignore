@@ -1,11 +1,11 @@
-/target
-**/*.rs.bk
-Cargo.lock.bak
-*.orig
-coverage/
-*.lcov
-/agetemplate/
-# 敏感与私有材料永不入库
+# 旧 Rust 实现，只作移植参考，不再跟踪
+.legacy/
+
+# Zig 构建产物
+.zig-cache/
+zig-out/
+
+# 敏感与私有材料永不入库（沿用旧实现约定）
 *.pcap
 *.pcapng
 *.rep
