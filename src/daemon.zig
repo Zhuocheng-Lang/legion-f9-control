@@ -48,13 +48,10 @@ fn run() !void {
         else => |e| return e,
     };
 
-    // 防双开：能连上说明已有实例在跑；连不上则清掉陈旧 socket 文件再绑定。
-    if (std.net.connectUnixSocket(path)) |s| {
-        s.close();
-        return error.AlreadyRunning;
-    } else |_| {
-        std.fs.deleteFileAbsolute(path) catch {};
-    }
+    // 防双开：对锁文件 flock，持锁期间残留 socket 必属死实例，直接清掉再绑定。
+    // （原来的 connect 探测 → 删除 → bind 三步有 TOCTOU 窗口）
+    _ = try acquireLock(path);
+    std.fs.deleteFileAbsolute(path) catch {};
 
     const addr = try std.net.Address.initUnix(path);
     var server = try addr.listen(.{});
@@ -73,6 +70,20 @@ fn run() !void {
         serve(conn.stream, &st);
         conn.stream.close();
     }
+}
+
+/// 对 `<socket>.lock` 加排他非阻塞 flock；已有实例持锁则报 AlreadyRunning。
+/// 返回的 File 由调用方持有不关：锁随 fd 存活，进程退出自动释放。
+fn acquireLock(sock_path: []const u8) !std.fs.File {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&buf, "{s}.lock", .{sock_path}) catch unreachable;
+    const f = try std.fs.createFileAbsolute(lock_path, .{});
+    errdefer f.close();
+    std.posix.flock(f.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) catch |err| switch (err) {
+        error.WouldBlock => return error.AlreadyRunning,
+        else => |e| return e,
+    };
+    return f;
 }
 
 fn serve(stream: std.net.Stream, st: *State) void {
@@ -110,7 +121,9 @@ fn onDevice(dev: usb.Device, req: ipc.Request, buf: []u8) ![]const u8 {
         .gear_get => ipc.formatGear(buf, try ops.gearGet(dev)),
         .gear_set => |g| blk: {
             try ops.gearSet(dev, g);
-            break :blk ipc.formatGear(buf, try ops.gearGet(dev)); // 回读确认
+            const got = try ops.gearGet(dev); // 回读确认
+            if (got != g) return error.GearMismatch;
+            break :blk ipc.formatGear(buf, got);
         },
     };
 }
@@ -123,4 +136,19 @@ fn log(comptime fmt: []const u8, args: anytype) void {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "acquireLock：同一路径不可重复加锁，释放后可再加" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&path_buf, "{s}/f9d.sock", .{dir});
+
+    const first = try acquireLock(sock);
+    try std.testing.expectError(error.AlreadyRunning, acquireLock(sock));
+    first.close();
+    const second = try acquireLock(sock);
+    second.close();
 }
