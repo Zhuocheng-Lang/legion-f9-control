@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // 唯一的库模块。protocol / transport / core / ipc 都挂在它下面，
+    // 唯一的库模块。protocol / usb / ops / ipc 都挂在它下面，
     // 两个可执行文件共用同一份实现。
     const f9 = b.addModule("f9", .{
         .root_source_file = b.path("src/root.zig"),
