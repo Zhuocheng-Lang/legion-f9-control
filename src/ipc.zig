@@ -1,8 +1,9 @@
 //! f9ctl ↔ f9d 的 IPC：Unix socket 上的单行请求 / 单行 JSON 响应。
 //!
 //! - socket 路径：root 实例用 `/run/f9d/f9d.sock`（0666，本地用户均可连）；
-//!   非 root（开发场景）用 `/tmp/f9d-<euid>.sock`。客户端先连系统级路径，
-//!   不存在再连当前用户路径。
+//!   非 root（开发场景）用 `$XDG_RUNTIME_DIR/f9d.sock`（目录本身 0700，
+//!   不可预测性问题由系统目录权限解决），未设置时回退 `/tmp/f9d-<euid>.sock`。
+//!   客户端先连系统级路径，失败（含陈旧 socket 拒连）再连当前用户路径。
 //! - 请求一行（`\n` 结尾）：`status` / `gear` / `gear <0-3>`。
 //! - 响应一行 JSON：成功 `{"flag":…,"rpm_raw":…,"rpm":…}` 或 `{"gear":…}`；
 //!   失败 `{"error":"<zig 错误名>"}`。错误名即线格式，展示文案归 f9ctl。
@@ -59,15 +60,29 @@ pub fn daemonSocketPath(buf: *[std.fs.max_path_bytes]u8) []const u8 {
     return userSocketPath(buf);
 }
 
-fn userSocketPath(buf: *[std.fs.max_path_bytes]u8) []const u8 {
+pub fn userSocketPath(buf: *[std.fs.max_path_bytes]u8) []const u8 {
+    // XDG_RUNTIME_DIR 由登录会话创建（0700、属主本人），天然防 /tmp 占位
+    if (std.posix.getenv("XDG_RUNTIME_DIR")) |dir| {
+        if (dir.len > 0) {
+            return std.fmt.bufPrint(buf, "{s}/f9d.sock", .{dir}) catch unreachable;
+        }
+    }
     return std.fmt.bufPrint(buf, "/tmp/f9d-{d}.sock", .{std.posix.geteuid()}) catch unreachable;
 }
 
 /// 客户端连接 daemon：优先系统级 socket，其次当前用户的开发 socket。
 pub fn connect() !std.net.Stream {
     if (std.fs.accessAbsolute(root_path, .{})) |_| {
-        return connectUnix(root_path);
+        // 系统级 socket 存在但拒绝连接（陈旧文件）时仍回退用户级
+        return connectUnix(root_path) catch |err| switch (err) {
+            error.DaemonNotRunning => connectUser(),
+            else => |e| return e,
+        };
     } else |_| {}
+    return connectUser();
+}
+
+fn connectUser() !std.net.Stream {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     return connectUnix(userSocketPath(&buf));
 }
@@ -81,7 +96,9 @@ fn connectUnix(path: []const u8) !std.net.Stream {
 }
 
 /// 读到 '\n' 为止（返回不含换行）；超时、对端关闭、超长各自报错。
+/// timeout_ms 是进入函数起的绝对上限，防止逐字节慢滴无限续命。
 pub fn readLine(stream: std.net.Stream, buf: []u8, timeout_ms: i32) ![]const u8 {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
     var n: usize = 0;
     while (true) {
         if (n == buf.len) return error.LineTooLong;
@@ -90,7 +107,10 @@ pub fn readLine(stream: std.net.Stream, buf: []u8, timeout_ms: i32) ![]const u8 
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        if (try std.posix.poll(&fds, timeout_ms) == 0) return error.Timeout;
+        const remaining = deadline - std.time.milliTimestamp();
+        if (remaining <= 0) return error.Timeout;
+        if (try std.posix.poll(&fds, @intCast(@min(remaining, std.math.maxInt(i32)))) == 0)
+            return error.Timeout;
         const got = try stream.read(buf[n..]);
         if (got == 0) return error.EndOfStream;
         // 旧数据里不可能有 '\n'（否则已返回），只搜新读入的段
@@ -110,7 +130,16 @@ pub fn call(alloc: std.mem.Allocator, req: Request) !std.json.Parsed(Reply) {
     try stream.writeAll("\n");
     var rbuf: [max_reply_len]u8 = undefined;
     const rline = try readLine(stream, &rbuf, io_timeout_ms);
-    return std.json.parseFromSlice(Reply, alloc, rline, .{ .ignore_unknown_fields = true });
+    return parseReply(alloc, rline);
+}
+
+fn parseReply(alloc: std.mem.Allocator, line: []const u8) !std.json.Parsed(Reply) {
+    // alloc_always：默认的 alloc_if_needed 会让无转义字符串借用源切片，
+    // 而源是 call() 栈上的 rbuf，返回后 Reply."error" 悬垂
+    return std.json.parseFromSlice(Reply, alloc, line, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
 }
 
 /// 以下三个 format* 供 daemon 构造响应行（不含换行）。
@@ -150,10 +179,31 @@ test "socket 路径按 euid 分支" {
     const p = daemonSocketPath(&buf);
     if (std.posix.geteuid() == 0) {
         try std.testing.expectEqualStrings(root_path, p);
+    } else if (std.posix.getenv("XDG_RUNTIME_DIR")) |dir| {
+        if (dir.len > 0) {
+            var expect_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const expect = std.fmt.bufPrint(&expect_buf, "{s}/f9d.sock", .{dir}) catch unreachable;
+            return std.testing.expectEqualStrings(expect, p);
+        }
+        try std.testing.expect(std.mem.startsWith(u8, p, "/tmp/f9d-"));
+        try std.testing.expect(std.mem.endsWith(u8, p, ".sock"));
     } else {
         try std.testing.expect(std.mem.startsWith(u8, p, "/tmp/f9d-"));
         try std.testing.expect(std.mem.endsWith(u8, p, ".sock"));
     }
+}
+
+test "parseReply：无转义字符串不借用源缓冲" {
+    const alloc = std.testing.allocator;
+    const line = "{\"error\":\"DeviceNotFound\"}";
+    const parsed = try parseReply(alloc, line);
+    defer parsed.deinit();
+    const name = parsed.value.@"error".?;
+    try std.testing.expectEqualStrings("DeviceNotFound", name);
+    // 源缓冲（调用方栈上）失效后内容仍须有效：指针不得落在源切片内
+    const src = @intFromPtr(line.ptr);
+    const dst = @intFromPtr(name.ptr);
+    try std.testing.expect(dst < src or dst >= src + line.len);
 }
 
 test "响应行是合法 JSON 且字段齐全" {
@@ -196,4 +246,29 @@ test "readLine：分片、超时与关闭" {
 
     right.close();
     try std.testing.expectError(error.EndOfStream, readLine(left, &buf, 1000));
+}
+
+test "readLine：绝对超时，慢滴不能续命" {
+    const fds = try std.posix.pipe();
+    const left: std.net.Stream = .{ .handle = fds[0] };
+    const right: std.fs.File = .{ .handle = fds[1] };
+    defer left.close();
+
+    // 每 20ms 滴一个字节；若每轮 poll 重新计时则永不超时（直至写满 LineTooLong）
+    const drip = std.Thread.spawn(.{}, struct {
+        fn run(f: std.fs.File) void {
+            defer f.close();
+            for (0..64) |_| {
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+                f.writeAll("x") catch return;
+            }
+        }
+    }.run, .{right}) catch unreachable;
+    defer drip.join();
+
+    const start = std.time.milliTimestamp();
+    var buf: [128]u8 = undefined; // 与上限同尺寸，确保先触发 Timeout 而非 LineTooLong
+    try std.testing.expectError(error.Timeout, readLine(left, &buf, 100));
+    const elapsed = std.time.milliTimestamp() - start;
+    try std.testing.expect(elapsed >= 100 and elapsed < 1000);
 }

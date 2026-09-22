@@ -10,7 +10,10 @@
 ## IPC（Unix socket）
 
 - 路径：root 实例 `/run/f9d/f9d.sock`（0666，本地用户均可控制风扇）；
-  非 root 开发实例 `/tmp/f9d-<euid>.sock`。客户端先连系统级路径，不存在再连用户级路径。
+  非 root 开发实例 `$XDG_RUNTIME_DIR/f9d.sock`（目录 0700、属主本人，避免 /tmp 可预测路径被占位），
+  未设置时回退 `/tmp/f9d-<euid>.sock`。客户端先连系统级路径，失败（含陈旧 socket 拒连）再连用户级路径。
+- 防双开：daemon 对 `<socket>.lock` 持排他 flock（随进程退出自动释放），
+  持锁后残留 socket 必属死实例，直接删除再绑定，无 TOCTOU 窗口。
 - 每连接一请求一响应，均为 `\n` 结尾的一行。
 - 请求：`status` / `gear` / `gear <0-3>`。
 - 响应（JSON）：成功 `{"flag":…,"rpm_raw":…,"rpm":…}` 或 `{"gear":…}`；
