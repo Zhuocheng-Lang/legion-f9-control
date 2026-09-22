@@ -105,8 +105,13 @@ const daemon_errors = error{
     CommandMismatch,
     ShortData,
     InvalidGear,
+    GearMismatch,
     PayloadTooLong,
     BadRequest,
+    // hidraw 拔插：write 侧 EIO/ENODEV、read 侧 EIO，以及 posix 层的兜底
+    InputOutput,
+    NoDevice,
+    Unexpected,
 };
 
 fn errorFromName(name: []const u8) ?daemon_errors {
@@ -133,6 +138,15 @@ fn print(comptime fmt: []const u8, args: anytype) !void {
     try std.fs.File.stdout().writeAll(line);
 }
 
+/// DaemonNotRunning 文案：按实际尝试过的 socket 路径拼，避免非 root 场景误导。
+fn daemonNotRunningMsg(buf: []u8) []const u8 {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.fs.accessAbsolute(ipc.root_path, .{})) |_| {
+        return "f9d 未运行（socket: " ++ ipc.root_path ++ "）";
+    } else |_| {}
+    return std.fmt.bufPrint(buf, "f9d 未运行（socket: {s}）", .{ipc.userSocketPath(&pbuf)}) catch "f9d 未运行";
+}
+
 fn fail(err: anyerror) noreturn {
     if (err == error.Usage) {
         std.fs.File.stderr().writeAll(usage) catch {};
@@ -140,7 +154,7 @@ fn fail(err: anyerror) noreturn {
     }
     var buf: [256]u8 = undefined;
     const msg: []const u8 = switch (err) {
-        error.DaemonNotRunning => "f9d 未运行（socket: " ++ ipc.root_path ++ "）",
+        error.DaemonNotRunning => daemonNotRunningMsg(&buf),
         error.DaemonError => "f9d 返回未知错误",
         error.BadReply => "f9d 响应格式异常",
         error.LineTooLong => "与 f9d 通信的报文超长",
@@ -157,6 +171,9 @@ fn fail(err: anyerror) noreturn {
         error.CommandMismatch => "响应命令回显不匹配",
         error.ShortData => "响应数据过短",
         error.InvalidGear => "设置块中的挡位值无效",
+        error.GearMismatch => "设置后回读的挡位与请求不一致",
+        error.InputOutput => "设备 I/O 错误，可能已拔出",
+        error.NoDevice => "设备不存在，可能已拔出",
         error.InvalidGearValue => "无效挡位（quiet/balanced/beast/turbo 或 0-3）",
         error.PayloadTooLong => "协议层载荷超长",
         else => std.fmt.bufPrint(&buf, "出错: {s}", .{@errorName(err)}) catch "出错",
