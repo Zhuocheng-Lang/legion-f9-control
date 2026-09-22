@@ -1,15 +1,14 @@
-//! f9ctl：Legion F9 控制命令行。
-//!
-//! stdout 只输出结果（默认人读、--json 为 JSON），诊断信息一律走 stderr。
+//! f9ctl：Legion F9 控制命令行。作为 f9d 的客户端经 Unix socket 收发请求，
+//! 不直接访问设备。stdout 只输出结果（默认人读、--json 为 JSON），诊断走 stderr。
 
 const std = @import("std");
 const f9 = @import("f9");
 
 const protocol = f9.protocol;
-const usb = f9.usb;
+const ipc = f9.ipc;
 
 const usage =
-    \\用法: f9ctl [--json] <命令>
+    \\用法: f9ctl [--json] <命令>        （需要先启动 f9d）
     \\
     \\命令:
     \\  status                            读取实时状态（flag、RPM）
@@ -48,77 +47,73 @@ fn run() !void {
     }
 
     const c = cmd orelse return error.Usage;
+    const alloc = std.heap.page_allocator;
 
     if (std.mem.eql(u8, c, "status")) {
         if (value != null) return error.Usage;
-        var dev = try usb.Device.open();
-        defer dev.close();
-        try cmdStatus(dev, json);
+        const parsed = try ipc.call(alloc, .status);
+        defer parsed.deinit();
+        const st = try unwrap(parsed.value);
+        const flag = st.flag orelse return error.BadReply;
+        const rpm_raw = st.rpm_raw orelse return error.BadReply;
+        const rpm = st.rpm orelse return error.BadReply;
+        if (json) {
+            try print("{{\"flag\":{d},\"rpm_raw\":{d},\"rpm\":{d}}}\n", .{ flag, rpm_raw, rpm });
+        } else {
+            try print("flag: 0x{x:0>2}\nrpm: {d}\n", .{ flag, rpm });
+        }
     } else if (std.mem.eql(u8, c, "gear")) {
-        // 先校验挡位参数，再碰设备
-        const gear: ?protocol.Gear = if (value) |v| try parseGear(v) else null;
-        var dev = try usb.Device.open();
-        defer dev.close();
-        try cmdGear(dev, json, gear);
+        // 先校验挡位参数，再碰 daemon
+        const req: ipc.Request = if (value) |v|
+            .{ .gear_set = try parseGear(v) }
+        else
+            .gear_get;
+        const parsed = try ipc.call(alloc, req);
+        defer parsed.deinit();
+        const n = (try unwrap(parsed.value)).gear orelse return error.BadReply;
+        const gear = std.meta.intToEnum(protocol.Gear, n) catch return error.BadReply;
+        if (json) {
+            try print("{{\"gear\":{d},\"gear_name\":\"{s}\"}}\n", .{ n, @tagName(gear) });
+        } else {
+            try print("gear: {s} ({d})\n", .{ @tagName(gear), n });
+        }
     } else {
         return error.Usage;
     }
 }
 
-fn cmdStatus(dev: usb.Device, json: bool) !void {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeRead(&req, .live_status, 0, 3);
-    const resp = try dev.transact(&req, .live_status);
-    const st = try protocol.decodeStatus(resp.bytes());
-
-    if (json) {
-        try printJson(.{ .flag = st.flag, .rpm_raw = st.rpm_raw, .rpm = st.rpm });
-    } else {
-        try print("flag: 0x{x:0>2}\nrpm: {d}\n", .{ st.flag, st.rpm });
+/// daemon 返回的 error 字段转回本地错误，统一走 fail() 文案。
+fn unwrap(reply: ipc.Reply) !ipc.Reply {
+    if (reply.@"error") |name| {
+        if (errorFromName(name)) |err| return err;
+        return error.DaemonError;
     }
+    return reply;
 }
 
-fn cmdGear(dev: usb.Device, json: bool, gear_arg: ?protocol.Gear) !void {
-    if (gear_arg) |gear| {
-        // 会话：0x01 打开 → 读-改-写设置块（其余不透明字节原样保留）→ 0x02 提交
-        try session(dev, true);
-        errdefer session(dev, false) catch {};
-        var block = try readSettings(dev);
-        protocol.setGear(&block, gear);
-        try writeSettings(dev, &block);
-        try session(dev, false);
+/// 错误名是 IPC 线格式的一部分，与 daemon 侧 @errorName 一一对应。
+const daemon_errors = error{
+    DeviceNotFound,
+    DeviceNotResponding,
+    AccessDenied,
+    Timeout,
+    Busy,
+    DeviceError,
+    BadStatus,
+    BadLength,
+    BadReportId,
+    CommandMismatch,
+    ShortData,
+    InvalidGear,
+    PayloadTooLong,
+    BadRequest,
+};
+
+fn errorFromName(name: []const u8) ?daemon_errors {
+    inline for (@typeInfo(daemon_errors).error_set.?) |e| {
+        if (std.mem.eql(u8, name, e.name)) return @field(daemon_errors, e.name);
     }
-
-    const block = try readSettings(dev);
-    const gear = try protocol.decodeGear(&block);
-    if (json) {
-        try printJson(.{ .gear = @intFromEnum(gear), .gear_name = @tagName(gear) });
-    } else {
-        try print("gear: {s} ({d})\n", .{ @tagName(gear), @intFromEnum(gear) });
-    }
-}
-
-fn session(dev: usb.Device, open: bool) !void {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeSession(&req, open);
-    _ = try dev.transact(&req, if (open) .session_open else .session_close);
-}
-
-fn readSettings(dev: usb.Device) ![protocol.settings_len]u8 {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeRead(&req, .settings_read, 0, protocol.settings_len);
-    const resp = try dev.transact(&req, .settings_read);
-    const data = resp.bytes();
-    if (data.len < protocol.settings_len) return error.ShortData;
-    var block: [protocol.settings_len]u8 = undefined;
-    @memcpy(&block, data[0..protocol.settings_len]);
-    return block;
-}
-
-fn writeSettings(dev: usb.Device, block: *const [protocol.settings_len]u8) !void {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeWrite(&req, .settings_write, 0, block);
-    _ = try dev.transact(&req, .settings_write);
+    return null;
 }
 
 fn parseGear(s: []const u8) error{InvalidGearValue}!protocol.Gear {
@@ -138,14 +133,6 @@ fn print(comptime fmt: []const u8, args: anytype) !void {
     try std.fs.File.stdout().writeAll(line);
 }
 
-fn printJson(value: anytype) !void {
-    const alloc = std.heap.page_allocator;
-    const out = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    defer alloc.free(out);
-    try std.fs.File.stdout().writeAll(out);
-    try std.fs.File.stdout().writeAll("\n");
-}
-
 fn fail(err: anyerror) noreturn {
     if (err == error.Usage) {
         std.fs.File.stderr().writeAll(usage) catch {};
@@ -153,10 +140,15 @@ fn fail(err: anyerror) noreturn {
     }
     var buf: [256]u8 = undefined;
     const msg: []const u8 = switch (err) {
+        error.DaemonNotRunning => "f9d 未运行（socket: " ++ ipc.root_path ++ "）",
+        error.DaemonError => "f9d 返回未知错误",
+        error.BadReply => "f9d 响应格式异常",
+        error.LineTooLong => "与 f9d 通信的报文超长",
+        error.EndOfStream => "f9d 提前关闭了连接",
         error.DeviceNotFound => "未找到设备（VID:PID 17ef:f00c）",
         error.DeviceNotResponding => "设备存在但协议接口无应答",
-        error.AccessDenied => "无权限访问 /dev/hidraw*（需要 root 或 udev 规则）",
-        error.Timeout => "等待设备响应超时",
+        error.AccessDenied => "f9d 无权限访问 /dev/hidraw*（需要 root 或 udev 规则）",
+        error.Timeout => "等待响应超时",
         error.Busy => "设备忙（状态 0xfe）",
         error.DeviceError => "设备返回错误（状态 0xff）",
         error.BadStatus => "响应状态字节未知",
