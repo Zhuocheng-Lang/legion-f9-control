@@ -1,7 +1,8 @@
 //! legion-f9-control 共享库 `f9`：f9ctl 与 f9d 共用的唯一模块。
 //!
-//! - `protocol`：USB 帧编解码与数据解码（纯函数）
+//! - `protocol`：设备协议的数据解码与 USB 帧编解码（纯函数）
 //! - `usb`：hidraw 设备发现与收发
+//! - `ble`：BLE 帧编解码与 BlueZ D-Bus 事务
 //! - `ops`：设备级业务操作（仅 f9d 使用）
 //! - `ipc`：f9ctl ↔ f9d 的 Unix socket 协议与客户端
 
@@ -9,6 +10,7 @@ const std = @import("std");
 
 pub const protocol = @import("protocol.zig");
 pub const usb = @import("usb.zig");
+pub const ble = @import("ble.zig");
 pub const ops = @import("ops.zig");
 pub const ipc = @import("ipc.zig");
 
@@ -18,6 +20,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("protocol.zig");
     _ = @import("usb.zig");
+    _ = @import("ble.zig");
     _ = @import("ops.zig");
     _ = @import("ipc.zig");
 }

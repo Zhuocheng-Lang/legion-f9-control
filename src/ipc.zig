@@ -19,9 +19,10 @@ pub const root_path = root_dir ++ "/f9d.sock";
 
 pub const max_request_len = 128;
 pub const max_reply_len = 256;
-/// 客户端等响应的上限。预算：gear set 最多 5 次 USB 事务（open/read/write/
-/// close + 回读）× 2s = 10s，再加设备惰性打开、多接口探测与调度余量。
-pub const io_timeout_ms = 15_000;
+/// 客户端等响应的上限。预算：USB 链路 gear set 最多 5 次事务（open/read/write/
+/// close + 回读）× 2s = 10s；BLE 链路单个请求含打开与失败收尾不超过 30s
+/// （见 ble.zig 的 request_budget_ms），故取 35s 留出调度余量。
+pub const io_timeout_ms = 35_000;
 
 pub const Request = union(enum) {
     status,

@@ -108,6 +108,15 @@ const daemon_errors = error{
     GearMismatch,
     PayloadTooLong,
     BadRequest,
+    // BLE 链路（ble.zig）：帧层
+    BadMagic,
+    LengthMismatch,
+    OffsetMismatch,
+    // BLE 链路（ble.zig）：链路层
+    BluezUnavailable,
+    GattUnsupported,
+    NotConnected,
+    DbusError,
     // hidraw 拔插：write 侧 EIO/ENODEV、read 侧 EIO，以及 posix 层的兜底
     InputOutput,
     NoDevice,
@@ -155,15 +164,24 @@ fn fail(err: anyerror) noreturn {
         std.process.exit(2);
     }
     var buf: [256]u8 = undefined;
-    const msg: []const u8 = switch (err) {
-        error.DaemonNotRunning => daemonNotRunningMsg(&buf),
+    const msg = messageFor(err, &buf);
+    var out: [320]u8 = undefined;
+    const line = std.fmt.bufPrint(&out, "f9ctl: {s}\n", .{msg}) catch "f9ctl: 出错\n";
+    std.fs.File.stderr().writeAll(line) catch {};
+    std.process.exit(1);
+}
+
+/// 错误 → 用户文案。buf 供需要动态拼接的分支使用。
+fn messageFor(err: anyerror, buf: []u8) []const u8 {
+    return switch (err) {
+        error.DaemonNotRunning => daemonNotRunningMsg(buf),
         error.DaemonError => "f9d 返回未知错误",
         error.BadReply => "f9d 响应格式异常",
         error.LineTooLong => "与 f9d 通信的报文超长",
         error.EndOfStream => "f9d 提前关闭了连接",
-        error.DeviceNotFound => "未找到设备（VID:PID 17ef:f00c）",
-        error.DeviceNotResponding => "设备存在但协议接口无应答",
-        error.AccessDenied => "f9d 无权限访问 /dev/hidraw*（需要 root 或 udev 规则）",
+        error.DeviceNotFound => "未找到设备（USB 17ef:f00c 或 BLE 服务 UUID/LEGION_F9_BT）",
+        error.DeviceNotResponding => "USB 设备存在但协议接口无应答",
+        error.AccessDenied => "无权限访问设备或 BlueZ（hidraw 需 root 或 udev 规则；BLE 需能连 system bus）",
         error.Timeout => "等待响应超时",
         error.Busy => "设备忙（状态 0xfe）",
         error.DeviceError => "设备返回错误（状态 0xff）",
@@ -176,12 +194,37 @@ fn fail(err: anyerror) noreturn {
         error.GearMismatch => "设置后回读的挡位与请求不一致",
         error.InputOutput => "设备 I/O 错误，可能已拔出",
         error.NoDevice => "设备不存在，可能已拔出",
+        error.BluezUnavailable => "BlueZ 不可用（system bus 未运行、无蓝牙适配器或蓝牙未启用）",
+        error.GattUnsupported => "设备缺少目标 GATT 服务/特征，或写特征不支持 write-with-response、通知特征不支持 notify",
+        error.NotConnected => "BLE 设备未连接或链路中断",
+        error.DbusError => "BlueZ D-Bus 调用失败（细节见 f9d 日志）",
+        error.BadMagic => "BLE 响应帧头（0xee）异常",
+        error.LengthMismatch => "BLE 响应声明长度与请求不符",
+        error.OffsetMismatch => "BLE 响应偏移与请求不符",
         error.InvalidGearValue => "无效挡位（quiet/balanced/beast/turbo 或 0-3）",
         error.PayloadTooLong => "协议层载荷超长",
-        else => std.fmt.bufPrint(&buf, "出错: {s}", .{@errorName(err)}) catch "出错",
+        error.BadRequest => "f9d 报告请求格式异常（f9ctl 与 f9d 版本不一致？）",
+        error.Unexpected => "未预期的系统错误（细节见 f9d 日志）",
+        else => std.fmt.bufPrint(buf, "出错: {s}", .{@errorName(err)}) catch "出错",
     };
-    var out: [320]u8 = undefined;
-    const line = std.fmt.bufPrint(&out, "f9ctl: {s}\n", .{msg}) catch "f9ctl: 出错\n";
-    std.fs.File.stderr().writeAll(line) catch {};
-    std.process.exit(1);
+}
+
+test "错误名解析：daemon 线格式全部可往返，未知名返回 null" {
+    // daemon 侧用 @errorName 作 IPC 线格式；这里保证每个名字都能映射回本地错误
+    inline for (@typeInfo(daemon_errors).error_set.?) |e| {
+        const err = errorFromName(e.name) orelse return error.TestUnexpectedError;
+        try std.testing.expectEqualStrings(e.name, @errorName(err));
+    }
+    try std.testing.expect(errorFromName("NoSuchError") == null);
+}
+
+test "daemon 线格式错误名都有专用文案（含 BLE 链路新增），不走兜底" {
+    var buf: [256]u8 = undefined;
+    inline for (@typeInfo(daemon_errors).error_set.?) |e| {
+        const msg = messageFor(@field(daemon_errors, e.name), &buf);
+        try std.testing.expect(!std.mem.startsWith(u8, msg, "出错: "));
+    }
+    // BLE 链路错误名抽查关键措辞
+    const msg = messageFor(error.BluezUnavailable, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "BlueZ") != null);
 }
