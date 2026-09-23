@@ -83,7 +83,8 @@ rpm_raw = little_endian(data[1], data[2])
 rpm     = rpm_raw >> 2
 ```
 
-未知尾部只能以 `unknown_fields`/原始十六进制在 expert 输出显示，不得赋予未经证实的语义。
+未知尾部只能以 `unknown_fields`/原始十六进制形式展示，不得赋予未经证实的语义；
+f9ctl v1 不输出未知尾部。
 
 ## 6. 设置块与挡位 `confirmed`
 
