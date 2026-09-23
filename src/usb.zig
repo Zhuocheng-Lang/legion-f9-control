@@ -54,6 +54,27 @@ pub const Device = struct {
     pub fn transact(dev: Device, req: *const [protocol.frame_len]u8, expect: protocol.Command) !protocol.Decoded {
         return exchange(dev.file, req, expect, response_timeout_ms);
     }
+
+    /// 读命令：与 BLE 链路同形语义，帧与事务由本层实现。
+    pub fn read(dev: Device, command: protocol.Command, offset: u16, len: u8) !protocol.Decoded {
+        var req: [protocol.frame_len]u8 = undefined;
+        try protocol.encodeRead(&req, command, offset, len);
+        return dev.transact(&req, command);
+    }
+
+    /// 写命令。
+    pub fn write(dev: Device, command: protocol.Command, offset: u16, payload: []const u8) !void {
+        var req: [protocol.frame_len]u8 = undefined;
+        try protocol.encodeWrite(&req, command, offset, payload);
+        _ = try dev.transact(&req, command);
+    }
+
+    /// 会话命令（USB 上同样要等响应帧，与 BLE 的 fire-and-forget 不同）。
+    pub fn session(dev: Device, is_open: bool) !void {
+        var req: [protocol.frame_len]u8 = undefined;
+        try protocol.encodeSession(&req, is_open);
+        _ = try dev.transact(&req, if (is_open) .session_open else .session_close);
+    }
 };
 
 /// 探测接口是否说本协议：发一次 0x1a 读请求并等合法响应（无副作用）。

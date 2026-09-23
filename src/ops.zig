@@ -1,25 +1,30 @@
-//! 设备级操作：把协议帧组合成完整的业务动作（状态读取 / 挡位读写）。
+//! 设备级操作：把设备语义操作组合成完整的业务动作（状态读取 / 挡位读写）。
 //! 只被 f9d 使用；f9ctl 一律经 IPC 间接触达设备。
+//!
+//! 只依赖三个链路无关的语义操作，具体帧与事务由 USB/BLE 各自实现：
+//! - `read(command, offset, len)`（返回带 `bytes()` 的响应数据）
+//! - `write(command, offset, payload)`
+//! - `session(open)`
+//! 这里用 anytype 而非接口：usb.Device / ble.Device / daemon 的链路 union 以同一
+//! 调用形状满足它，测试可注入 fake。
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const usb = @import("usb.zig");
 
 /// 读取实时状态（flag 与 RPM）。
-pub fn status(dev: usb.Device) !protocol.LiveStatus {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeRead(&req, .live_status, 0, 3);
-    const resp = try dev.transact(&req, .live_status);
+pub fn status(dev: anytype) !protocol.LiveStatus {
+    const resp = try dev.read(.live_status, 0, 3);
     return protocol.decodeStatus(resp.bytes());
 }
 
 /// 读取挡位。
-pub fn gearGet(dev: usb.Device) !protocol.Gear {
+pub fn gearGet(dev: anytype) !protocol.Gear {
     const block = try readSettings(dev);
     return protocol.decodeGear(&block);
 }
 
 /// 设置挡位：会话 open → 读-改-写设置块（不透明字节原样保留）→ 会话 close 提交。
-/// dev 用 anytype 仅为了让测试注入 mock（usb.Device 以值语义满足同一调用形状）。
+/// 失败不重放写入：open 一旦发出，失败路径也 best-effort 补 close（设备侧会话
+/// 可能已开），但绝不重发写命令、也不在同一请求里换链路。
 pub fn gearSet(dev: anytype, gear: protocol.Gear) !void {
     // open 失败也可能是“请求已送达、响应丢失”：设备侧会话其实已打开，
     // 必须 best-effort 补发 close，故清理从发出 open 起就覆盖。
@@ -30,20 +35,17 @@ pub fn gearSet(dev: anytype, gear: protocol.Gear) !void {
     errdefer session(dev, false) catch {};
     var block = try readSettings(dev);
     protocol.setGear(&block, gear);
-    try writeSettings(dev, &block);
+    try dev.write(.settings_write, 0, &block);
+    // close 是提交：失败不得当成功
     try session(dev, false);
 }
 
 fn session(dev: anytype, open: bool) !void {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeSession(&req, open);
-    _ = try dev.transact(&req, if (open) .session_open else .session_close);
+    return dev.session(open);
 }
 
 fn readSettings(dev: anytype) ![protocol.settings_len]u8 {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeRead(&req, .settings_read, 0, protocol.settings_len);
-    const resp = try dev.transact(&req, .settings_read);
+    const resp = try dev.read(.settings_read, 0, protocol.settings_len);
     const data = resp.bytes();
     if (data.len < protocol.settings_len) return error.ShortData;
     var block: [protocol.settings_len]u8 = undefined;
@@ -51,61 +53,114 @@ fn readSettings(dev: anytype) ![protocol.settings_len]u8 {
     return block;
 }
 
-fn writeSettings(dev: anytype, block: *const [protocol.settings_len]u8) !void {
-    var req: [protocol.frame_len]u8 = undefined;
-    try protocol.encodeWrite(&req, .settings_write, 0, block);
-    _ = try dev.transact(&req, .settings_write);
-}
-
 test {
     std.testing.refAllDecls(@This());
 }
 
-/// 记录 transact 调用序列的 mock；fail_at 命中时模拟“请求送达但响应丢失”。
-/// settings_read 返回 read_block，settings_write 捕获请求帧数据区中的设置块，
-/// 用于验证读-改-写只动挡位字节、其余原样保留。
+const Op = enum { session_open, session_close, read, write };
+
+/// 记录调用序列的设备 fake；fail_at 命中时模拟“请求送达但响应丢失”。
+/// settings_read 返回 read_block，settings_write 捕获 payload，
+/// 用于验证读-改-写只动挡位字节、其余原样保留，以及写失败不重放。
 const MockDev = struct {
-    seq: [8]protocol.Command = undefined,
+    seq: [8]Op = undefined,
     n: usize = 0,
-    fail_at: ?protocol.Command = null,
+    fail_at: ?Op = null,
     read_block: [protocol.settings_len]u8 = [_]u8{0xA5} ** protocol.settings_len,
+    status_data: [3]u8 = .{ 0x02, 0xf4, 0x1f },
+    reads: [4]struct { command: protocol.Command, offset: u16, len: u8 } = undefined,
+    n_reads: usize = 0,
+    writes: usize = 0,
     written: ?[protocol.settings_len]u8 = null,
 
-    pub fn transact(self: *MockDev, req: *const [protocol.frame_len]u8, expect: protocol.Command) !protocol.Decoded {
-        self.seq[self.n] = expect;
+    fn rec(self: *MockDev, op: Op) void {
+        self.seq[self.n] = op;
         self.n += 1;
-        if (self.fail_at == expect) return error.Timeout;
-        if (expect == .settings_write) self.written = req[8..][0..protocol.settings_len].*; // 帧数据区
-        var resp: protocol.Decoded = .{ .offset = 0, .buf = [_]u8{0} ** protocol.max_payload, .len = protocol.settings_len };
-        if (expect == .settings_read) resp.buf[0..protocol.settings_len].* = self.read_block;
+    }
+
+    pub fn read(self: *MockDev, command: protocol.Command, offset: u16, len: u8) !protocol.Decoded {
+        self.rec(.read);
+        self.reads[self.n_reads] = .{ .command = command, .offset = offset, .len = len };
+        self.n_reads += 1;
+        if (self.fail_at == .read) return error.Timeout;
+        var resp: protocol.Decoded = .{ .offset = offset, .buf = undefined, .len = 0 };
+        switch (command) {
+            .settings_read => {
+                resp.buf[0..protocol.settings_len].* = self.read_block;
+                resp.len = protocol.settings_len;
+            },
+            .live_status => {
+                resp.buf[0..3].* = self.status_data;
+                resp.len = 3;
+            },
+            else => return error.CommandMismatch,
+        }
         return resp;
     }
+
+    pub fn write(self: *MockDev, command: protocol.Command, offset: u16, payload: []const u8) !void {
+        _ = offset;
+        if (command != .settings_write) return error.CommandMismatch;
+        self.rec(.write);
+        // 计数在失败判定之前：用于断言“失败后不重放写入”
+        self.writes += 1;
+        self.written = payload[0..protocol.settings_len].*;
+        if (self.fail_at == .write) return error.Timeout;
+    }
+
+    pub fn session(self: *MockDev, open: bool) !void {
+        const op: Op = if (open) .session_open else .session_close;
+        self.rec(op);
+        if (self.fail_at == op) return error.Timeout;
+    }
 };
+
+test "status：读 0x1a offset 0 长度 3，解码 rpm" {
+    var mock: MockDev = .{};
+    const st = try status(&mock);
+    try std.testing.expectEqual(protocol.Command.live_status, mock.reads[0].command);
+    try std.testing.expectEqual(@as(u16, 0), mock.reads[0].offset);
+    try std.testing.expectEqual(@as(u8, 3), mock.reads[0].len);
+    try std.testing.expectEqual(@as(u16, 2045), st.rpm);
+    try std.testing.expectEqual(@as(u8, 0x02), st.flag);
+}
+
+test "gearGet：读 0x05 offset 0 长度 15 的 byte[13]" {
+    var mock: MockDev = .{};
+    mock.read_block[13] = 2;
+    try std.testing.expectEqual(protocol.Gear.beast, try gearGet(&mock));
+    try std.testing.expectEqual(protocol.Command.settings_read, mock.reads[0].command);
+    try std.testing.expectEqual(@as(u8, protocol.settings_len), mock.reads[0].len);
+}
 
 test "gearSet：open 响应丢失时仍补发 session_close" {
     var mock: MockDev = .{ .fail_at = .session_open };
     try std.testing.expectError(error.Timeout, gearSet(&mock, .turbo));
-    try std.testing.expectEqualSlices(protocol.Command, &.{ .session_open, .session_close }, mock.seq[0..mock.n]);
+    try std.testing.expectEqualSlices(Op, &.{ .session_open, .session_close }, mock.seq[0..mock.n]);
+    try std.testing.expectEqual(@as(usize, 0), mock.writes); // 未写入
 }
 
-test "gearSet：中途失败经 errdefer 关闭会话" {
-    var mock: MockDev = .{ .fail_at = .settings_write };
+test "gearSet：中途失败经 errdefer 关闭会话，且不重放写入" {
+    var mock: MockDev = .{ .fail_at = .write };
     try std.testing.expectError(error.Timeout, gearSet(&mock, .turbo));
     try std.testing.expectEqualSlices(
-        protocol.Command,
-        &.{ .session_open, .settings_read, .settings_write, .session_close },
+        Op,
+        &.{ .session_open, .read, .write, .session_close },
         mock.seq[0..mock.n],
     );
+    try std.testing.expectEqual(@as(usize, 1), mock.writes); // 只写过一次，没有重放
 }
 
 test "gearSet：完整序列 open → read → write → close，写入帧为读-改-写结果" {
     var mock: MockDev = .{};
     try gearSet(&mock, .turbo);
     try std.testing.expectEqualSlices(
-        protocol.Command,
-        &.{ .session_open, .settings_read, .settings_write, .session_close },
+        Op,
+        &.{ .session_open, .read, .write, .session_close },
         mock.seq[0..mock.n],
     );
+    try std.testing.expectEqual(protocol.Command.settings_read, mock.reads[0].command);
+    try std.testing.expectEqual(@as(u8, protocol.settings_len), mock.reads[0].len);
     // 目标挡位已写入 byte[13]，其余不透明字节与读回块一致
     const written = mock.written.?;
     try std.testing.expectEqual(protocol.Gear.turbo, try protocol.decodeGear(&written));
