@@ -13,7 +13,8 @@
   非 root 开发实例 `$XDG_RUNTIME_DIR/f9d.sock`（避免 /tmp 可预测路径被占位）。
   安全前提：该目录属主本人且权限不宽于 0700——非 root f9d 启动前校验，不满足拒绝启动。
   未设置 XDG_RUNTIME_DIR 时 f9d 拒绝启动（报 NoRuntimeDir），不回退 `/tmp/f9d-<euid>.sock`：
-  公共 /tmp 下可预测的 socket/lock 路径可被符号链接攻击（锁文件创建会截断目标），
+  公共 /tmp 下可预测的 socket/lock 路径仍可被占位干扰（锁文件创建曾会截断被链接的目标文件，
+  现创建时 `.truncate = false` 已消除该副作用，但占位与干扰本身仍在），
   最小安全方案就是只用可信目录。客户端先连系统级路径，失败（含陈旧 socket 拒连）再连用户级路径。
 - 防双开：daemon 对 `<socket>.lock` 持排他 flock（随进程退出自动释放），
   持锁后残留 socket 必属死实例，直接删除再绑定，无 TOCTOU 窗口。
