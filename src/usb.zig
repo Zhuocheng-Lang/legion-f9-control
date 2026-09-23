@@ -15,7 +15,16 @@ pub const Device = struct {
 
     /// 找到 VID:PID 匹配且能应答协议探测的接口并打开（读写）。
     pub fn open() !Device {
-        var dir = try std.fs.openDirAbsolute("/sys/class/hidraw", .{ .iterate = true });
+        return openFrom("/sys/class/hidraw");
+    }
+
+    /// 与 open 分离出来仅为可测：hidraw 子系统缺失/为空都归一化为 DeviceNotFound。
+    fn openFrom(sys_class_hidraw: []const u8) !Device {
+        var dir = std.fs.openDirAbsolute(sys_class_hidraw, .{ .iterate = true }) catch |err| switch (err) {
+            // 无 hidraw 子系统（未加载/容器）：与“没插设备”同等对待
+            error.FileNotFound => return error.DeviceNotFound,
+            else => |e| return e,
+        };
         defer dir.close();
 
         var matched = false;
@@ -93,6 +102,15 @@ fn matchVidPid(uevent: []const u8) bool {
         return v == vid and p == pid;
     }
     return false;
+}
+
+test "缺少 hidraw 子系统时归一化为 DeviceNotFound" {
+    try std.testing.expectError(error.DeviceNotFound, Device.openFrom("/nonexistent-path"));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buf);
+    try std.testing.expectError(error.DeviceNotFound, Device.openFrom(dir)); // 空目录无接口
 }
 
 test "匹配 uevent 中的 HID_ID" {

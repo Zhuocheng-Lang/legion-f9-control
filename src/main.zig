@@ -144,7 +144,9 @@ fn daemonNotRunningMsg(buf: []u8) []const u8 {
     if (std.fs.accessAbsolute(ipc.root_path, .{})) |_| {
         return "f9d 未运行（socket: " ++ ipc.root_path ++ "）";
     } else |_| {}
-    return std.fmt.bufPrint(buf, "f9d 未运行（socket: {s}）", .{ipc.userSocketPath(&pbuf)}) catch "f9d 未运行";
+    const upath = ipc.userSocketPath(&pbuf) catch
+        return "f9d 未运行（且未设置 XDG_RUNTIME_DIR，用户级 f9d 拒绝回退 /tmp）";
+    return std.fmt.bufPrint(buf, "f9d 未运行（socket: {s}）", .{upath}) catch "f9d 未运行";
 }
 
 fn fail(err: anyerror) noreturn {
