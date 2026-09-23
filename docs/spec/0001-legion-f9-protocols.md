@@ -38,14 +38,17 @@
 
 ## 3. BLE 帧 `confirmed`
 
-固定 20 字节：
+请求固定 20 字节；响应为变长（5 字节头 + `length` 字节数据）：
 
 ```text
-request:  [0]=0xee [1]=command [2]=length [3:4]=offset LE [5:20]=payload
-response: [0]=0xee [1]=command [2]=length [3:4]=offset LE [5:20]=data
+request:  [0]=0xee [1]=command [2]=length [3:4]=offset LE [5:20]=payload（定长 20，尾部补零）
+response: [0]=0xee [1]=command [2]=length [3:4]=offset LE [5:5+length]=data（总长恰为 5+length，≤20）
 ```
 
 - 单帧 payload 上限 15 字节；无 USB 式校验和。
+- 响应长度按 `5 + length` 校验，**不是定长 20**（早期“恰好 20 字节”的写法只在
+  length=15 时碰巧成立）。真机证据：读 `0x1a` 长度 3 → 通知共 8 字节；
+  读 `0x05` 长度 15 → 通知共 20 字节。
 - `0x01`、`0x02` 会话命令不等待通知，按 fire-and-forget 处理。
 - 其他命令必须匹配帧头、command、长度与 offset。
 - **不能只用响应 `[7]` 判错**——它在有效响应中属于数据。
@@ -88,10 +91,11 @@ byte[13] = gear
 0 quiet / 1 balanced / 2 beast / 3 turbo
 ```
 
-## 7. 会话命令会话语义 `inferred`（待真机验收复核）
+## 7. 会话命令会话语义 `confirmed`（真机验收已复核）
 
 - 会话 open/close 的请求体按 1 字节标记（`0x01`/`0x02`）发送；
-- BLE 上不等待通知即视为已发送。
+- BLE 上不等待通知即视为已发送；
+- 真机验收：open → 读设置块 → 写 `0x06` → close → 回读挡位一致（写 `quiet`/`balanced` 均生效）。
 
 ## 8. 测试向量（脱敏、手工构造）
 
@@ -104,4 +108,11 @@ byte[13] = gear
 ee 05 0f 0000 | 00*15
 # 状态数据
 flag=02, rpm_raw=0x1FF4 → rpm = 0x1FF4 >> 2 = 2045
+```
+
+真机验收采集（confirmed，仅帧结构与公开字段，不含设备标识）：
+
+```text
+# BLE 状态响应（0x1a, length 3）：变长帧共 8 字节
+ee 1a 03 0000 | 01 0d 27  →  flag=01, rpm_raw=0x270D, rpm=2499
 ```
