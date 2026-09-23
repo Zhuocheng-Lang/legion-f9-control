@@ -416,13 +416,19 @@ fn readChangedValue(m: *c.sd_bus_message, ctx: *NotifyCtx) Error!void {
         }
         var bytes: Bytes = .{};
         try variantBytes(m, &bytes);
-        ctx.len = bytes.len;
-        if (bytes.len > 0) {
-            const n = @min(bytes.len, ctx.buf.len);
-            @memcpy(ctx.buf[0..n], bytes.ptr[0..n]);
-        }
-        ctx.have = true;
+        adoptValue(ctx, bytes);
     }
+}
+
+/// 采纳 Value 字节到通知上下文。空值不构成响应帧，不置 have、继续等真响应：
+/// 空 `ay` 与非 `ay`（variantBytes 跳过后 bytes 保持为空）若置位，transact 会收到
+/// 0 字节帧，被 decodeResponse 判为结构性坏帧（BadLength）直接判死整个事务。
+fn adoptValue(ctx: *NotifyCtx, bytes: Bytes) void {
+    if (bytes.len == 0) return;
+    ctx.len = bytes.len;
+    const n = @min(bytes.len, ctx.buf.len);
+    @memcpy(ctx.buf[0..n], bytes.ptr[0..n]);
+    ctx.have = true;
 }
 
 // ---- 对象枚举：GetManagedObjects 的 a{oa{sa{sv}}} ----
@@ -1014,4 +1020,17 @@ test "事务：超过 20 字节的通知按结构性坏帧立即失败" {
     try encodeRead(&req, .live_status, 0, 3);
     try std.testing.expectError(error.BadLength, transact(&g, .live_status, 0, 3, &req));
     try std.testing.expectEqual(@as(usize, 1), g.read_count); // 不继续等下一帧
+}
+
+test "adoptValue：空 ay 与非 ay 的 Value 不置 have，继续等真响应" {
+    var ctx: NotifyCtx = .{};
+    adoptValue(&ctx, .{}); // 空值：置 have 会产出 0 字节帧并把整个事务判死
+    try std.testing.expect(!ctx.have);
+    try std.testing.expectEqual(@as(usize, 0), ctx.len);
+
+    const data = [_]u8{ 0xee, 0x1a, 0x03 };
+    adoptValue(&ctx, .{ .ptr = &data, .len = data.len });
+    try std.testing.expect(ctx.have);
+    try std.testing.expectEqual(@as(usize, 3), ctx.len);
+    try std.testing.expectEqualSlices(u8, &data, ctx.buf[0..ctx.len]);
 }
