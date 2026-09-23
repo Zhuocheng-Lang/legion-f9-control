@@ -35,6 +35,9 @@
 - 响应状态：`0x00` 成功、`0xfe` 忙、`0xff` 错误。
 - 解码器必须检查长度、report ID、command 回显与状态，不得索引短包。
 - report ID 5 一律拒绝（不属于本协议实现的任何合法收发路径）。
+- offset/长度回显的请求一致性 `unknown`：本节解码只校验声明长度与帧内一致性，
+  不回比请求的 offset 与期望长度；BLE 则全对称校验（`OffsetMismatch`/
+  `LengthMismatch`，§3）。两链路不对称是已知现状，v1 不在 USB 侧新增校验。
 
 ## 3. BLE 帧 `confirmed`
 
