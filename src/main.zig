@@ -153,8 +153,10 @@ fn daemonNotRunningMsg(buf: []u8) []const u8 {
     if (std.fs.accessAbsolute(ipc.root_path, .{})) |_| {
         return "f9d 未运行（socket: " ++ ipc.root_path ++ "）";
     } else |_| {}
-    const upath = ipc.userSocketPath(&pbuf) catch
-        return "f9d 未运行（且未设置 XDG_RUNTIME_DIR，用户级 f9d 拒绝回退 /tmp）";
+    const upath = ipc.userSocketPath(&pbuf) catch |err| switch (err) {
+        error.NoRuntimeDir => return "f9d 未运行（且未设置 XDG_RUNTIME_DIR，用户级 f9d 拒绝回退 /tmp）",
+        error.PathTooLong => return "XDG_RUNTIME_DIR 过长，拼不出 f9d socket 路径",
+    };
     return std.fmt.bufPrint(buf, "f9d 未运行（socket: {s}）", .{upath}) catch "f9d 未运行";
 }
 

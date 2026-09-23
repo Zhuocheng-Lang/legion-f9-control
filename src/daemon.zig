@@ -116,6 +116,10 @@ fn run() !void {
             log("f9d: 未设置 XDG_RUNTIME_DIR，拒绝回退到 /tmp（可预测路径有符号链接攻击风险）", .{});
             std.process.exit(1);
         },
+        error.PathTooLong => {
+            log("f9d: XDG_RUNTIME_DIR 过长，socket 路径放不下，拒绝启动", .{});
+            std.process.exit(1);
+        },
     };
     const is_root = std.posix.geteuid() == 0;
     // 非 root 实例的安全前提：XDG_RUNTIME_DIR 属主本人且权限不宽于 0700，
@@ -157,7 +161,8 @@ fn run() !void {
 /// 返回的 File 由调用方持有不关：锁随 fd 存活，进程退出自动释放。
 fn acquireLock(sock_path: []const u8) !std.fs.File {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const lock_path = std.fmt.bufPrint(&buf, "{s}.lock", .{sock_path}) catch unreachable;
+    // XDG_RUNTIME_DIR 可超长：拼不进缓冲报错，不用 unreachable panic
+    const lock_path = std.fmt.bufPrint(&buf, "{s}.lock", .{sock_path}) catch return error.PathTooLong;
     // truncate=false：即使锁文件路径被符号链接占位也不截断目标文件
     // （socket 目录本应可信，此为纵深防御）。
     const f = try std.fs.createFileAbsolute(lock_path, .{ .truncate = false });
@@ -312,4 +317,10 @@ test "State：双链路都不可用时 dev 保持空，错误原样上报" {
     var st: State = .{};
     try std.testing.expectError(error.BluezUnavailable, st.ensure(Fake.usbMissing, Fake.bleDown));
     try std.testing.expect(st.dev == null);
+}
+
+test "acquireLock：锁路径过长报 PathTooLong，不触碰文件系统" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    @memset(&path_buf, 'x'); // 满长 + ".lock" 必然放不下
+    try std.testing.expectError(error.PathTooLong, acquireLock(&path_buf));
 }

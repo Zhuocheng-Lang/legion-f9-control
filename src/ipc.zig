@@ -69,14 +69,17 @@ pub fn daemonSocketPath(buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
 
 /// XDG_RUNTIME_DIR 由登录会话创建（0700、属主本人），天然防 /tmp 占位；
 /// 未设置时报 NoRuntimeDir——可预测的 /tmp 路径会被符号链接攻击，拒绝回退。
+/// 拼接过长报 PathTooLong（该 env 由用户控制、可超长），不 panic。
 /// 该前提由 f9d 启动前的 validateRuntimeDir 实际校验，这里只负责拼路径。
-pub fn userSocketPath(buf: *[std.fs.max_path_bytes]u8) error{NoRuntimeDir}![]const u8 {
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |dir| {
-        if (dir.len > 0) {
-            return std.fmt.bufPrint(buf, "{s}/f9d.sock", .{dir}) catch unreachable;
-        }
-    }
-    return error.NoRuntimeDir;
+pub fn userSocketPath(buf: *[std.fs.max_path_bytes]u8) error{ NoRuntimeDir, PathTooLong }![]const u8 {
+    const dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse return error.NoRuntimeDir;
+    if (dir.len == 0) return error.NoRuntimeDir; // 空串视为未设置：拒绝回退 /tmp
+    return socketPathIn(dir, buf);
+}
+
+/// 与读环境变量分离仅为可测：`<dir>/f9d.sock` 拼不进固定缓冲时报 PathTooLong。
+fn socketPathIn(dir: []const u8, buf: *[std.fs.max_path_bytes]u8) error{PathTooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/f9d.sock", .{dir}) catch return error.PathTooLong;
 }
 
 /// 非 root f9d 启动前的安全前提：XDG_RUNTIME_DIR 指向的目录必须属主本人、
@@ -220,6 +223,14 @@ test "socket 路径按 euid 分支" {
         try std.testing.expectError(error.NoRuntimeDir, daemonSocketPath(&buf));
         try std.testing.expectError(error.NoRuntimeDir, userSocketPath(&buf));
     }
+}
+
+test "socket 路径拼接过长报 PathTooLong（XDG_RUNTIME_DIR 可超长）" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir: [std.fs.max_path_bytes]u8 = undefined;
+    @memset(&dir, 'a'); // 满长目录名 + "/f9d.sock" 必然放不下
+    try std.testing.expectError(error.PathTooLong, socketPathIn(&dir, &buf));
+    try std.testing.expectEqualStrings("/run/f9d/f9d.sock", try socketPathIn("/run/f9d", &buf));
 }
 
 test "parseReply：无转义字符串不借用源缓冲" {
