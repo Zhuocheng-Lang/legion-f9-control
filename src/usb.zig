@@ -97,6 +97,9 @@ fn exchange(file: std.fs.File, req: *const [protocol.frame_len]u8, expect: proto
 
     var buf: [protocol.frame_len]u8 = undefined;
     const n = try file.read(&buf);
+    // poll 可读但读到 0 字节 = 设备已拔（EOF）：归一为 NoDevice，
+    // 否则 0 字节会被 decodeResponse 报成误导性的 BadLength“响应帧长度异常”
+    if (n == 0) return error.NoDevice;
     return protocol.decodeResponse(buf[0..n], expect);
 }
 
@@ -138,4 +141,13 @@ test "匹配 uevent 中的 HID_ID" {
     try std.testing.expect(matchVidPid("HID_NAME=LEGION_F9_Wired\nHID_ID=0003:000017EF:0000F00C\n"));
     try std.testing.expect(!matchVidPid("HID_ID=0003:00003434:00000860\n"));
     try std.testing.expect(!matchVidPid("HID_NAME=LEGION_F9_Wired\n"));
+}
+
+test "exchange：poll 可读但读到 0 字节（拔线 EOF）报 NoDevice" {
+    // /dev/null 写入即丢、读立即返回 EOF，语义等同“设备消失”
+    const f = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .read_write });
+    defer f.close();
+    var req: [protocol.frame_len]u8 = undefined;
+    try protocol.encodeRead(&req, .live_status, 0, 3);
+    try std.testing.expectError(error.NoDevice, exchange(f, &req, .live_status, 100));
 }
