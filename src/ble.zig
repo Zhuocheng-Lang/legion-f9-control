@@ -18,6 +18,8 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+// 与 ipc.zig 同源的单调期限时钟（root ↔ ble 文件引用由 Zig 惰性分析支持）
+const monoMs = @import("root.zig").monoMs;
 
 const c = @cImport({
     @cInclude("systemd/sd-bus.h");
@@ -776,12 +778,6 @@ fn appendStr(m: *c.sd_bus_message, s: [:0]const u8) Error!void {
 }
 
 // ---- 期限与日志 ----
-
-/// 单调时钟毫秒（期限不受墙钟调整影响）。
-fn monoMs() i64 {
-    const ts = std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC) catch return 0;
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
-}
 
 fn remainingUsec(deadline_ms: i64) u64 {
     const left = deadline_ms - monoMs();

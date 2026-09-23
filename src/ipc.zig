@@ -13,6 +13,8 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+// 单调期限与 ble.zig 同源：墙钟回拨不放大 remaining，35s 慢滴上界始终成立
+const monoMs = @import("root.zig").monoMs;
 
 pub const root_dir = "/run/f9d";
 pub const root_path = root_dir ++ "/f9d.sock";
@@ -122,8 +124,9 @@ fn connectUnix(path: []const u8) !std.net.Stream {
 
 /// 读到 '\n' 为止（返回不含换行）；超时、对端关闭、超长各自报错。
 /// timeout_ms 是进入函数起的绝对上限，防止逐字节慢滴无限续命。
+/// 期限基于单调时钟（root.monoMs）：墙钟调整不会改变剩余时间。
 pub fn readLine(stream: std.net.Stream, buf: []u8, timeout_ms: i32) ![]const u8 {
-    const deadline = std.time.milliTimestamp() + timeout_ms;
+    const deadline = monoMs() + timeout_ms;
     var n: usize = 0;
     while (true) {
         if (n == buf.len) return error.LineTooLong;
@@ -132,7 +135,7 @@ pub fn readLine(stream: std.net.Stream, buf: []u8, timeout_ms: i32) ![]const u8 
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        const remaining = deadline - std.time.milliTimestamp();
+        const remaining = deadline - monoMs();
         if (remaining <= 0) return error.Timeout;
         if (try std.posix.poll(&fds, @intCast(@min(remaining, std.math.maxInt(i32)))) == 0)
             return error.Timeout;

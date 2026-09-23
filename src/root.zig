@@ -8,6 +8,13 @@
 
 const std = @import("std");
 
+/// 单调时钟毫秒（期限不受墙钟调整影响）。ble.zig 与 ipc.zig 共用，保证
+/// D-Bus 事务与 IPC 读行的期限语义一致（墙钟回拨不放大剩余时间、不破坏上限）。
+pub fn monoMs() i64 {
+    const ts = std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC) catch return 0;
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
+
 pub const protocol = @import("protocol.zig");
 pub const usb = @import("usb.zig");
 pub const ble = @import("ble.zig");
