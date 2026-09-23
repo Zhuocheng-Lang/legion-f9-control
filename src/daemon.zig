@@ -10,6 +10,7 @@ const usb = f9.usb;
 const ble = f9.ble;
 const ops = f9.ops;
 const ipc = f9.ipc;
+const log = f9.log;
 
 /// 客户端连上后保持沉默的上限，防止单个连接堵死所有请求。
 const conn_read_timeout_ms = 5000;
@@ -214,12 +215,6 @@ fn onDevice(dev: *Link, req: ipc.Request, buf: []u8) ![]const u8 {
             break :blk ipc.formatGear(buf, got);
         },
     };
-}
-
-fn log(comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
-    std.fs.File.stderr().writeAll(line) catch {};
 }
 
 test {

@@ -15,6 +15,13 @@ pub fn monoMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
 }
 
+/// 诊断日志统一走 stderr（stdout 只留结果）。f9d 与 ble 链路共用一份。
+pub fn log(comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    std.fs.File.stderr().writeAll(line) catch {};
+}
+
 pub const protocol = @import("protocol.zig");
 pub const usb = @import("usb.zig");
 pub const ble = @import("ble.zig");

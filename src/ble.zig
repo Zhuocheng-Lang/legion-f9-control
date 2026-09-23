@@ -18,8 +18,9 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
-// 与 ipc.zig 同源的单调期限时钟（root ↔ ble 文件引用由 Zig 惰性分析支持）
+// root ↔ ble 文件引用由 Zig 惰性分析支持；期限与日志同 f9d/ipc 共用一份
 const monoMs = @import("root.zig").monoMs;
+const log = @import("root.zig").log;
 
 const c = @cImport({
     @cInclude("systemd/sd-bus.h");
@@ -777,18 +778,12 @@ fn appendStr(m: *c.sd_bus_message, s: [:0]const u8) Error!void {
     try check(c.sd_bus_message_append_basic(m, 's', @ptrCast(s.ptr)));
 }
 
-// ---- 期限与日志 ----
+// ---- 期限 ----
 
 fn remainingUsec(deadline_ms: i64) u64 {
     const left = deadline_ms - monoMs();
     if (left <= 0) return 1; // 已过期 → 让调用立刻超时
     return @as(u64, @intCast(left)) * std.time.us_per_ms;
-}
-
-fn log(comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
-    std.fs.File.stderr().writeAll(line) catch {};
 }
 
 // ---------------------------------------------------------------------------

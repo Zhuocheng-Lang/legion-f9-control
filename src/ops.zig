@@ -29,25 +29,21 @@ pub fn gearGet(dev: anytype) !protocol.Gear {
 pub fn gearSet(dev: anytype, gear: protocol.Gear) !void {
     // open 失败也可能是“请求已送达、响应丢失”：设备侧会话其实已打开，
     // 必须 best-effort 补发 close，故清理从发出 open 起就覆盖。
-    session(dev, true) catch |err| {
-        session(dev, false) catch {};
+    dev.session(true) catch |err| {
+        dev.session(false) catch {};
         return err;
     };
     {
         // errdefer 只覆盖读/写阶段，失败补一次 close；最终 close 在块外执行，
         // 失败不再补发第二次（已失败的链路上再等一个事务超时没有意义，
         // 设备侧会话由下次 open 收敛）。行为由 session_close 失败测试钉住。
-        errdefer session(dev, false) catch {};
+        errdefer dev.session(false) catch {};
         var block = try readSettings(dev);
         protocol.setGear(&block, gear);
         try dev.write(.settings_write, 0, &block);
     }
     // close 是提交：失败不得当成功，也不再补发（见上）
-    try session(dev, false);
-}
-
-fn session(dev: anytype, open: bool) !void {
-    return dev.session(open);
+    try dev.session(false);
 }
 
 fn readSettings(dev: anytype) ![protocol.settings_len]u8 {
