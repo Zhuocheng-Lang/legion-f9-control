@@ -1,30 +1,100 @@
-//! f9d：Legion F9 设备 daemon。独占 hidraw 设备，经 Unix socket 向 f9ctl
-//! 提供单行请求 / JSON 响应服务（协议见 ipc.zig）。前台运行，日志走 stderr
+//! f9d：Legion F9 设备 daemon。独占设备（优先 USB，必要时 BLE），经 Unix socket
+//! 向 f9ctl 提供单行请求 / JSON 响应服务（协议见 ipc.zig）。前台运行，日志走 stderr
 //! （systemd 收进 journal）；由 init 系统负责生命周期与重启。
 
 const std = @import("std");
 const f9 = @import("f9");
 
+const protocol = f9.protocol;
 const usb = f9.usb;
+const ble = f9.ble;
 const ops = f9.ops;
 const ipc = f9.ipc;
 
 /// 客户端连上后保持沉默的上限，防止单个连接堵死所有请求。
 const conn_read_timeout_ms = 5000;
 
-/// 设备句柄：惰性打开（设备可能晚于 daemon 启动插入），失败后丢弃。
-const State = struct {
-    dev: ?usb.Device = null,
+/// 设备链路：USB 优先，仅 USB 未找到/无应答时才用 BLE（见 openPreferred）。
+/// 一次请求内不换链路、不重放写入；失败即丢弃句柄，下个请求重新选择。
+/// ops 只依赖下面三个语义操作，具体帧与事务由 USB/BLE 各自实现。
+const Link = union(enum) {
+    usb: usb.Device,
+    ble: ble.Device,
 
-    fn ensure(st: *State) !usb.Device {
-        if (st.dev == null) {
-            st.dev = try usb.Device.open();
-            log("f9d: 设备已连接", .{});
-        }
-        return st.dev.?;
+    pub fn read(self: *Link, command: protocol.Command, offset: u16, len: u8) !protocol.Decoded {
+        return switch (self.*) {
+            .usb => |d| d.read(command, offset, len),
+            .ble => |*d| d.read(command, offset, len),
+        };
     }
 
-    /// ponytail: 任何事务错误都丢弃句柄、由下个请求惰性重开来覆盖拔插；
+    pub fn write(self: *Link, command: protocol.Command, offset: u16, payload: []const u8) !void {
+        return switch (self.*) {
+            .usb => |d| d.write(command, offset, payload),
+            .ble => |*d| d.write(command, offset, payload),
+        };
+    }
+
+    pub fn session(self: *Link, open: bool) !void {
+        return switch (self.*) {
+            .usb => |d| d.session(open),
+            .ble => |*d| d.session(open),
+        };
+    }
+
+    /// 复用链路时重置 BLE 的整请求预算（上个请求的可能已耗尽）。
+    /// 新打开的链路由 ble.open 入口起算预算（含扫描/连接/服务解析），不重置。
+    /// ops 不依赖它；USB 无状态，是空操作。
+    pub fn beginRequest(self: *Link) void {
+        switch (self.*) {
+            .usb => {},
+            .ble => |*d| d.beginRequest(),
+        }
+    }
+
+    pub fn close(self: *Link) void {
+        switch (self.*) {
+            .usb => |*d| d.close(),
+            .ble => |*d| d.close(),
+        }
+    }
+};
+
+/// USB 优先；仅当 USB 未找到/无应答时回落 BLE。
+/// 权限等其他 USB 错误原样上报：不能用 BLE 掩盖 USB 权限问题。
+fn openPreferred(usb_open: anytype, ble_open: anytype) !Link {
+    const dev = usb_open() catch |err| {
+        if (!shouldTryBle(err)) return err;
+        return .{ .ble = try ble_open() };
+    };
+    return .{ .usb = dev };
+}
+
+/// 纯策略：只有“未发现设备 / 设备无应答”允许尝试 BLE。
+fn shouldTryBle(usb_err: anyerror) bool {
+    return switch (usb_err) {
+        error.DeviceNotFound, error.DeviceNotResponding => true,
+        else => false,
+    };
+}
+
+/// 设备句柄：惰性打开（设备可能晚于 daemon 启动接入），失败后丢弃。
+/// 打开函数注入仅为可测；生产调用传 usb.Device.open / ble.Device.open。
+const State = struct {
+    dev: ?Link = null,
+
+    fn ensure(st: *State, usb_open: anytype, ble_open: anytype) !*Link {
+        if (st.dev == null) {
+            st.dev = try openPreferred(usb_open, ble_open);
+            log("f9d: 设备已连接（{s}）", .{@tagName(st.dev.?)});
+            // 新链路：BLE 预算已从 open 入口起算（含打开），不再重置
+        } else {
+            st.dev.?.beginRequest(); // 复用：上个请求的预算可能已耗尽
+        }
+        return &st.dev.?;
+    }
+
+    /// ponytail: 任何事务错误都丢弃句柄、由下个请求惰性重开来覆盖拔插/断线；
     /// 不做重试/退避，拔插频繁到日志噪声时可再加。
     fn drop(st: *State) void {
         if (st.dev) |*d| d.close();
@@ -120,7 +190,7 @@ fn dispatch(st: *State, line: []const u8, buf: []u8) []const u8 {
 }
 
 fn runRequest(st: *State, req: ipc.Request, buf: []u8) ![]const u8 {
-    const dev = try st.ensure();
+    const dev = try st.ensure(usb.Device.open, ble.Device.open);
     // ensure 之后发生的任何错误都视为设备链路问题，丢弃句柄待下次重开
     return onDevice(dev, req, buf) catch |err| {
         st.drop();
@@ -128,7 +198,7 @@ fn runRequest(st: *State, req: ipc.Request, buf: []u8) ![]const u8 {
     };
 }
 
-fn onDevice(dev: usb.Device, req: ipc.Request, buf: []u8) ![]const u8 {
+fn onDevice(dev: *Link, req: ipc.Request, buf: []u8) ![]const u8 {
     return switch (req) {
         .status => ipc.formatStatus(buf, try ops.status(dev)),
         .gear_get => ipc.formatGear(buf, try ops.gearGet(dev)),
@@ -164,4 +234,82 @@ test "acquireLock：同一路径不可重复加锁，释放后可再加" {
     first.close();
     const second = try acquireLock(sock);
     second.close();
+}
+
+test "设备选择：仅 USB 未找到/无应答才回落 BLE，权限错误不兜底" {
+    const Fake = struct {
+        var ble_calls: usize = 0;
+        fn usbMissing() !usb.Device {
+            return error.DeviceNotFound;
+        }
+        fn usbSilent() !usb.Device {
+            return error.DeviceNotResponding;
+        }
+        fn usbDenied() !usb.Device {
+            return error.AccessDenied;
+        }
+        fn bleOpened() !ble.Device {
+            ble_calls += 1;
+            return undefined; // 只验证选择逻辑，不碰真实会话
+        }
+    };
+
+    Fake.ble_calls = 0;
+    const missing = try openPreferred(Fake.usbMissing, Fake.bleOpened);
+    try std.testing.expectEqual(@as(usize, 1), Fake.ble_calls);
+    try std.testing.expectEqual(std.meta.activeTag(missing), .ble);
+
+    const silent = try openPreferred(Fake.usbSilent, Fake.bleOpened);
+    try std.testing.expectEqual(@as(usize, 2), Fake.ble_calls);
+    try std.testing.expectEqual(std.meta.activeTag(silent), .ble);
+
+    // 权限错误原样上报，且不得再试 BLE
+    try std.testing.expectError(error.AccessDenied, openPreferred(Fake.usbDenied, Fake.bleOpened));
+    try std.testing.expectEqual(@as(usize, 2), Fake.ble_calls);
+    try std.testing.expect(!shouldTryBle(error.AccessDenied));
+    try std.testing.expect(!shouldTryBle(error.Timeout));
+}
+
+test "State：复用期间不重复打开，丢弃后下个请求惰性重开" {
+    const Fake = struct {
+        var usb_calls: usize = 0;
+        var ble_calls: usize = 0;
+        fn usbOk() !usb.Device {
+            usb_calls += 1;
+            // /dev/null 充当假句柄：close 只关它，无副作用
+            return .{ .file = try std.fs.openFileAbsolute("/dev/null", .{}) };
+        }
+        fn bleDown() !ble.Device {
+            ble_calls += 1;
+            return error.BluezUnavailable;
+        }
+    };
+
+    Fake.usb_calls = 0;
+    Fake.ble_calls = 0;
+    var st: State = .{};
+    const first = try st.ensure(Fake.usbOk, Fake.bleDown);
+    const again = try st.ensure(Fake.usbOk, Fake.bleDown);
+    try std.testing.expect(first == again); // 同一句柄：不换链路、不重复打开
+    try std.testing.expectEqual(@as(usize, 1), Fake.usb_calls);
+    st.drop(); // 事务失败路径：丢弃句柄
+    try std.testing.expect(st.dev == null);
+    _ = try st.ensure(Fake.usbOk, Fake.bleDown); // 下个请求惰性重开并重新选择
+    try std.testing.expectEqual(@as(usize, 2), Fake.usb_calls);
+    try std.testing.expectEqual(@as(usize, 0), Fake.ble_calls); // USB 可用就不碰 BLE
+    st.drop();
+}
+
+test "State：双链路都不可用时 dev 保持空，错误原样上报" {
+    const Fake = struct {
+        fn usbMissing() !usb.Device {
+            return error.DeviceNotFound;
+        }
+        fn bleDown() !ble.Device {
+            return error.BluezUnavailable;
+        }
+    };
+    var st: State = .{};
+    try std.testing.expectError(error.BluezUnavailable, st.ensure(Fake.usbMissing, Fake.bleDown));
+    try std.testing.expect(st.dev == null);
 }
