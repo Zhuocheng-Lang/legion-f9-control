@@ -25,6 +25,7 @@ pub fn gearGet(dev: anytype) !protocol.Gear {
 /// 设置挡位：会话 open → 读-改-写设置块（不透明字节原样保留）→ 会话 close 提交。
 /// 失败不重放写入：open 一旦发出，失败路径也 best-effort 补 close（设备侧会话
 /// 可能已开），但绝不重发写命令、也不在同一请求里换链路。
+/// 每条失败路径至多补发一次 close：最终 close（提交）自身的失败不再补发。
 pub fn gearSet(dev: anytype, gear: protocol.Gear) !void {
     // open 失败也可能是“请求已送达、响应丢失”：设备侧会话其实已打开，
     // 必须 best-effort 补发 close，故清理从发出 open 起就覆盖。
@@ -32,11 +33,16 @@ pub fn gearSet(dev: anytype, gear: protocol.Gear) !void {
         session(dev, false) catch {};
         return err;
     };
-    errdefer session(dev, false) catch {};
-    var block = try readSettings(dev);
-    protocol.setGear(&block, gear);
-    try dev.write(.settings_write, 0, &block);
-    // close 是提交：失败不得当成功
+    {
+        // errdefer 只覆盖读/写阶段，失败补一次 close；最终 close 在块外执行，
+        // 失败不再补发第二次（已失败的链路上再等一个事务超时没有意义，
+        // 设备侧会话由下次 open 收敛）。行为由 session_close 失败测试钉住。
+        errdefer session(dev, false) catch {};
+        var block = try readSettings(dev);
+        protocol.setGear(&block, gear);
+        try dev.write(.settings_write, 0, &block);
+    }
+    // close 是提交：失败不得当成功，也不再补发（见上）
     try session(dev, false);
 }
 
@@ -149,6 +155,17 @@ test "gearSet：中途失败经 errdefer 关闭会话，且不重放写入" {
         mock.seq[0..mock.n],
     );
     try std.testing.expectEqual(@as(usize, 1), mock.writes); // 只写过一次，没有重放
+}
+
+test "gearSet：close（提交）失败时不补发第二次 close，错误原样上报" {
+    var mock: MockDev = .{ .fail_at = .session_close };
+    try std.testing.expectError(error.Timeout, gearSet(&mock, .turbo));
+    try std.testing.expectEqualSlices(
+        Op,
+        &.{ .session_open, .read, .write, .session_close },
+        mock.seq[0..mock.n],
+    );
+    try std.testing.expectEqual(@as(usize, 1), mock.writes); // 已写入：close 失败不回滚也不重放
 }
 
 test "gearSet：完整序列 open → read → write → close，写入帧为读-改-写结果" {
