@@ -41,8 +41,19 @@ pub fn main() void {
 
 fn run() !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = ipc.daemonSocketPath(&path_buf);
+    const path = ipc.daemonSocketPath(&path_buf) catch |err| switch (err) {
+        error.NoRuntimeDir => {
+            log("f9d: 未设置 XDG_RUNTIME_DIR，拒绝回退到 /tmp（可预测路径有符号链接攻击风险）", .{});
+            std.process.exit(1);
+        },
+    };
     const is_root = std.posix.geteuid() == 0;
+    // 非 root 实例的安全前提：XDG_RUNTIME_DIR 属主本人且权限不宽于 0700，
+    // 否则 socket/lock 仍可被同机其他用户占位——不满足即拒绝启动。
+    if (!is_root) ipc.validateRuntimeDir() catch {
+        log("f9d: XDG_RUNTIME_DIR 须为属主本人、权限不宽于 0700 的目录，拒绝启动", .{});
+        std.process.exit(1);
+    };
     if (is_root) std.fs.makeDirAbsolute(ipc.root_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => |e| return e,
@@ -77,7 +88,9 @@ fn run() !void {
 fn acquireLock(sock_path: []const u8) !std.fs.File {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const lock_path = std.fmt.bufPrint(&buf, "{s}.lock", .{sock_path}) catch unreachable;
-    const f = try std.fs.createFileAbsolute(lock_path, .{});
+    // truncate=false：即使锁文件路径被符号链接占位也不截断目标文件
+    // （socket 目录本应可信，此为纵深防御）。
+    const f = try std.fs.createFileAbsolute(lock_path, .{ .truncate = false });
     errdefer f.close();
     std.posix.flock(f.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) catch |err| switch (err) {
         error.WouldBlock => return error.AlreadyRunning,

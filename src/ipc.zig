@@ -1,8 +1,11 @@
 //! f9ctl ↔ f9d 的 IPC：Unix socket 上的单行请求 / 单行 JSON 响应。
 //!
 //! - socket 路径：root 实例用 `/run/f9d/f9d.sock`（0666，本地用户均可连）；
-//!   非 root（开发场景）用 `$XDG_RUNTIME_DIR/f9d.sock`（目录本身 0700，
-//!   不可预测性问题由系统目录权限解决），未设置时回退 `/tmp/f9d-<euid>.sock`。
+//!   非 root（开发场景）用 `$XDG_RUNTIME_DIR/f9d.sock`。安全前提：该目录属主
+//!   本人且权限不宽于 0700，f9d 启动前由 validateRuntimeDir 校验、不满足即拒绝
+//!   启动。未设置 XDG_RUNTIME_DIR 时拒绝回退
+//!   /tmp：可预测的 `/tmp/f9d-<euid>.sock` 及其 `.lock` 可被符号链接攻击，
+//!   与其在公共目录里做防护，不如直接拒绝（P1 安全决策）。
 //!   客户端先连系统级路径，失败（含陈旧 socket 拒连）再连当前用户路径。
 //! - 请求一行（`\n` 结尾）：`status` / `gear` / `gear <0-3>`。
 //! - 响应一行 JSON：成功 `{"flag":…,"rpm_raw":…,"rpm":…}` 或 `{"gear":…}`；
@@ -16,8 +19,9 @@ pub const root_path = root_dir ++ "/f9d.sock";
 
 pub const max_request_len = 128;
 pub const max_reply_len = 256;
-/// 客户端等响应的上限：覆盖设备 2s 收发 + 惰性重开的探测耗时。
-pub const io_timeout_ms = 10_000;
+/// 客户端等响应的上限。预算：gear set 最多 5 次 USB 事务（open/read/write/
+/// close + 回读）× 2s = 10s，再加设备惰性打开、多接口探测与调度余量。
+pub const io_timeout_ms = 15_000;
 
 pub const Request = union(enum) {
     status,
@@ -55,19 +59,37 @@ pub fn formatRequest(buf: []u8, req: Request) []const u8 {
 }
 
 /// daemon 侧 socket 路径：root → 系统级，否则用户级。
-pub fn daemonSocketPath(buf: *[std.fs.max_path_bytes]u8) []const u8 {
+pub fn daemonSocketPath(buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
     if (std.posix.geteuid() == 0) return root_path;
     return userSocketPath(buf);
 }
 
-pub fn userSocketPath(buf: *[std.fs.max_path_bytes]u8) []const u8 {
-    // XDG_RUNTIME_DIR 由登录会话创建（0700、属主本人），天然防 /tmp 占位
+/// XDG_RUNTIME_DIR 由登录会话创建（0700、属主本人），天然防 /tmp 占位；
+/// 未设置时报 NoRuntimeDir——可预测的 /tmp 路径会被符号链接攻击，拒绝回退。
+/// 该前提由 f9d 启动前的 validateRuntimeDir 实际校验，这里只负责拼路径。
+pub fn userSocketPath(buf: *[std.fs.max_path_bytes]u8) error{NoRuntimeDir}![]const u8 {
     if (std.posix.getenv("XDG_RUNTIME_DIR")) |dir| {
         if (dir.len > 0) {
             return std.fmt.bufPrint(buf, "{s}/f9d.sock", .{dir}) catch unreachable;
         }
     }
-    return std.fmt.bufPrint(buf, "/tmp/f9d-{d}.sock", .{std.posix.geteuid()}) catch unreachable;
+    return error.NoRuntimeDir;
+}
+
+/// 非 root f9d 启动前的安全前提：XDG_RUNTIME_DIR 指向的目录必须属主本人、
+/// 权限不宽于 0700，否则 socket/lock 仍可被同机其他用户占位干扰。
+pub fn validateRuntimeDir() error{UntrustedRuntimeDir}!void {
+    const dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse return error.UntrustedRuntimeDir;
+    if (dir.len == 0) return error.UntrustedRuntimeDir;
+    return checkTrustedDir(dir);
+}
+
+/// 与读环境变量分离出来仅为可测。fstatat 跟随符号链接：链到 /tmp 一样被拒。
+fn checkTrustedDir(dir: []const u8) error{UntrustedRuntimeDir}!void {
+    const st = std.posix.fstatat(std.posix.AT.FDCWD, dir, 0) catch return error.UntrustedRuntimeDir;
+    if (st.mode & std.posix.S.IFMT != std.posix.S.IFDIR) return error.UntrustedRuntimeDir;
+    if (st.uid != std.posix.geteuid()) return error.UntrustedRuntimeDir;
+    if (st.mode & 0o077 != 0) return error.UntrustedRuntimeDir;
 }
 
 /// 客户端连接 daemon：优先系统级 socket，其次当前用户的开发 socket。
@@ -84,7 +106,9 @@ pub fn connect() !std.net.Stream {
 
 fn connectUser() !std.net.Stream {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    return connectUnix(userSocketPath(&buf));
+    // 无 XDG_RUNTIME_DIR 时 daemon 同样拒绝启动，直接报未运行
+    const path = userSocketPath(&buf) catch return error.DaemonNotRunning;
+    return connectUnix(path);
 }
 
 fn connectUnix(path: []const u8) !std.net.Stream {
@@ -176,20 +200,21 @@ test "请求格式化与解析往返" {
 
 test "socket 路径按 euid 分支" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const p = daemonSocketPath(&buf);
     if (std.posix.geteuid() == 0) {
-        try std.testing.expectEqualStrings(root_path, p);
+        try std.testing.expectEqualStrings(root_path, try daemonSocketPath(&buf));
     } else if (std.posix.getenv("XDG_RUNTIME_DIR")) |dir| {
         if (dir.len > 0) {
             var expect_buf: [std.fs.max_path_bytes]u8 = undefined;
             const expect = std.fmt.bufPrint(&expect_buf, "{s}/f9d.sock", .{dir}) catch unreachable;
-            return std.testing.expectEqualStrings(expect, p);
+            return std.testing.expectEqualStrings(expect, try daemonSocketPath(&buf));
         }
-        try std.testing.expect(std.mem.startsWith(u8, p, "/tmp/f9d-"));
-        try std.testing.expect(std.mem.endsWith(u8, p, ".sock"));
+        // 空字符串视为未设置：拒绝回退 /tmp
+        try std.testing.expectError(error.NoRuntimeDir, daemonSocketPath(&buf));
+        try std.testing.expectError(error.NoRuntimeDir, userSocketPath(&buf));
     } else {
-        try std.testing.expect(std.mem.startsWith(u8, p, "/tmp/f9d-"));
-        try std.testing.expect(std.mem.endsWith(u8, p, ".sock"));
+        // 无 XDG_RUNTIME_DIR：拒绝回退 /tmp（可预测路径有符号链接攻击风险）
+        try std.testing.expectError(error.NoRuntimeDir, daemonSocketPath(&buf));
+        try std.testing.expectError(error.NoRuntimeDir, userSocketPath(&buf));
     }
 }
 
@@ -271,4 +296,22 @@ test "readLine：绝对超时，慢滴不能续命" {
     try std.testing.expectError(error.Timeout, readLine(left, &buf, 100));
     const elapsed = std.time.milliTimestamp() - start;
     try std.testing.expect(elapsed >= 100 and elapsed < 1000);
+}
+
+test "checkTrustedDir：属主本人且权限不宽于 0700 才接受" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buf);
+
+    // tmpDir 句柄是 O_PATH，Dir.chmod 走 fchmod 会 EBADF，只能按路径 fchmodat
+    try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0);
+    try checkTrustedDir(dir); // 属主本人 + 0700：接受
+    try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o755, 0);
+    try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(dir)); // 他人可读：拒绝
+
+    try tmp.dir.writeFile(.{ .sub_path = "f", .data = "" });
+    const file = try tmp.dir.realpath("f", &buf);
+    try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(file)); // 非目录：拒绝
+    try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir("/nonexistent-f9d-path"));
 }
