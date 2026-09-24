@@ -13,7 +13,17 @@
   权限等其他 USB 错误原样上报，不用 BLE 掩盖。两条链路都不可用时返回 `DeviceNotFound`。
 - **一次请求只用一条链路**：事务失败不重放写入、不在同请求内换链路；
   daemon 丢弃句柄（`State.drop`），下个请求惰性重开并重新选择。
-- **USB**：`usb.zig`，按 VID:PID 发现 hidraw 接口，64 字节帧事务。
+- **USB**：`usb.zig`，按 VID:PID 发现 hidraw 接口，64 字节帧事务；响应不足 64 字节
+  视为坏帧（不回比请求 offset/长度，见 spec §2）。同一节点还承载键盘等其他报告与设备
+  主动推送的短通知，事务层丢弃非本次响应的帧（spec §2 真机 confirmed）。
+  同一设备会枚举出多个 hidraw 接口，
+  逐个探测（发一次无副作用的 `0x1a` 读）：只有“接口不应答”（`Timeout`）或“设备已拔”
+  （`NoDevice`）才继续试下一个接口；协议层的应答错误（`Busy` / `DeviceError` / 未知状态）
+  与权限、I/O 错误一律原样上报，不得吞成 `DeviceNotResponding`——否则会把
+  “没权限 / I/O 失败 / 设备报错”误导为“设备不在”而错误回落 BLE。
+  拔线中的 errno 自行翻译（拔线实测写回 `EPROTO`，普通拔线可能是 `ENODEV`/`ENXIO`/
+  `ESHUTDOWN`）：一律归为 `NoDevice`；不用 `std.fs.File.write/read` 是因为它们对未建模
+  errno 会打整段堆栈并只给 `Unexpected`（用户看到“未预期的系统错误”，且不会回落 BLE）。
 - **BLE**：`ble.zig`，请求定长 20 字节、响应变长（5 字节头 + length 字节，spec §3 confirmed）；
   经系统 libsystemd 的 sd-bus 直连 BlueZ。
   设备发现以服务 UUID 为主、名称 `LEGION_F9_BT` 为辅（广告可能不含服务 UUID），
