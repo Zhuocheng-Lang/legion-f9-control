@@ -78,14 +78,15 @@ pub fn encodeSession(buf: *[frame_len]u8, open: bool) EncodeError!void {
     return encodeWrite(buf, if (open) .session_open else .session_close, 0, &marker);
 }
 
-/// 解码响应帧。检查长度、report ID、命令回显与状态，不解引用短包；
-/// 校验和不参与判定（USB 链路层已有 CRC）。
+/// 解码响应帧。协议规定响应恒为 64 字节：不足 64 的截断帧一律 `BadLength`，
+/// 即使其声明的数据长度在帧内自洽也不接受；随后检查 report ID、命令回显与状态，
+/// 不解引用短包；校验和不参与判定（USB 链路层已有 CRC）。
 pub fn decodeResponse(raw: []const u8, expect: Command) DecodeError!Decoded {
-    if (raw.len < 8) return error.BadLength;
+    if (raw.len != frame_len) return error.BadLength;
     if (raw[0] != report_id) return error.BadReportId;
     if (raw[3] != @intFromEnum(expect)) return error.CommandMismatch;
     const len = raw[4];
-    if (len > max_payload or raw.len < 8 + @as(usize, len)) return error.BadLength;
+    if (len > max_payload) return error.BadLength;
     switch (raw[7]) {
         0x00 => {},
         0xfe => return error.Busy,
@@ -172,6 +173,9 @@ test "响应解码：拒绝短包、report ID 5、回显不符与异常状态" {
 
     try std.testing.expectError(error.BadLength, decodeResponse(buf[0..7], .live_status));
     try std.testing.expectError(error.BadLength, decodeResponse(buf[0..10], .live_status));
+
+    // 截断帧：声明长度自洽也不接受（协议规定响应定长 64 字节）
+    try std.testing.expectError(error.BadLength, decodeResponse(buf[0..63], .live_status));
 
     buf[4] = 200; // 长度字段越界
     try std.testing.expectError(error.BadLength, decodeResponse(&buf, .live_status));
