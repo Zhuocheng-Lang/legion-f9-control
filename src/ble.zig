@@ -190,7 +190,8 @@ const Bytes = struct {
 /// 字符串值拷入固定缓冲（不借用消息生命周期），列表值只判命中、不收集整表。
 const Props = struct {
     uuid: Str = .{},
-    service: Str = .{},
+    service: Str = .{}, // GattCharacteristic1 所属服务的对象路径
+    device: Str = .{}, // GattService1 所属设备的对象路径
     name: Str = .{},
     alias: Str = .{},
     services_resolved: ?bool = null,
@@ -266,9 +267,10 @@ pub const Device = struct {
         };
         try waitResolved(bus_ptr, dev.z(), deadline);
 
-        // 服务/特征在连接并解析后才出现；UUID、所属服务与必需的 flags 都要对得上
+        // 服务/特征在连接并解析后才出现；UUID、设备归属、所属服务与必需的 flags 都要对得上
         var service: Str = .{};
-        if (!try find(bus_ptr, &FindService{ .out = &service }, deadline)) return error.GattUnsupported;
+        const sfind = FindService{ .out = &service, .device = dev.slice() };
+        if (!try find(bus_ptr, &sfind, deadline)) return error.GattUnsupported;
         var wchar: Str = .{};
         const wfind = FindCharacteristic{ .out = &wchar, .uuid = write_uuid, .service = service.z(), .flag = .write };
         if (!try find(bus_ptr, &wfind, deadline)) return error.GattUnsupported;
@@ -492,6 +494,8 @@ fn parseProps(m: *c.sd_bus_message, p: *Props) Error!void {
             try variantString(m, "s", 's', &p.uuid);
         } else if (std.mem.eql(u8, key, "Service")) {
             try variantString(m, "o", 'o', &p.service); // GattCharacteristic1.Service 是对象路径
+        } else if (std.mem.eql(u8, key, "Device")) {
+            try variantString(m, "o", 'o', &p.device); // GattService1.Device 是对象路径
         } else if (std.mem.eql(u8, key, "Name")) {
             try variantString(m, "s", 's', &p.name);
         } else if (std.mem.eql(u8, key, "Alias")) {
@@ -595,11 +599,16 @@ const FindDevice = struct {
     }
 };
 
+/// 目标服务：UUID 命中且**属于选中的那台设备**。GetManagedObjects 返回全适配器
+/// 的对象树；只按 UUID 全局查找会在多台同类设备同时在线时把别的设备的服务
+/// 关联到当前候选设备上，所以必须用 GattService1.Device 限定归属。
 const FindService = struct {
     out: *Str,
+    device: []const u8,
     fn visit(self: *const FindService, path: []const u8, iface: []const u8, props: *const Props) Error!bool {
         if (!std.mem.eql(u8, iface, gatt_service_iface)) return false;
         if (!std.mem.eql(u8, props.uuid.slice(), service_uuid)) return false;
+        if (!std.mem.eql(u8, props.device.slice(), self.device)) return false;
         try self.out.set(path);
         return true;
     }
@@ -825,6 +834,73 @@ fn responseFrame(buf: *[frame_len]u8, command: protocol.Command, offset: u16, le
     std.mem.writeInt(u16, buf[3..5], offset, .little);
     @memcpy(buf[5..][0..data.len], data);
     return buf[0 .. 5 + data.len]; // 响应变长：总长恰为 5+length
+}
+
+/// 测试用对象树：模拟 GetManagedObjects 的条目（对象路径 / 接口 / 属性），
+/// 按 `walkObjects` 相同的顺序逐项喂给 visitor。
+const TestObject = struct {
+    path: []const u8,
+    iface: []const u8,
+    props: Props,
+};
+
+fn visitTree(objects: []const TestObject, ctx: anytype) Error!bool {
+    for (objects) |*o| {
+        if (try ctx.visit(o.path, o.iface, &o.props)) return true;
+    }
+    return false;
+}
+
+/// 构造固定字符串属性（仅测试用：短字面量，不做长度校验）。
+fn strOf(comptime s: []const u8) Str {
+    comptime std.debug.assert(s.len < path_max - 1);
+    var out: Str = .{};
+    @memcpy(out.buf[0..s.len], s);
+    out.buf[s.len] = 0;
+    out.len = s.len;
+    return out;
+}
+
+test "服务/特征归属：多设备对象树只采纳选中设备下的服务与特征" {
+    const dev_a = "/org/bluez/hci0/dev_AA";
+    const dev_b = "/org/bluez/hci0/dev_BB";
+    const svc_a = dev_a ++ "/service0001";
+    const svc_b = dev_b ++ "/service0001";
+    const chr_a = svc_a ++ "/char0002";
+    const chr_b = svc_b ++ "/char0002";
+
+    // 两台同类设备同时在线：另一台设备的服务/特征刻意排在前面，
+    // 只按 UUID 全局查找就会把 dev_B 的服务关联给 dev_A。
+    const objects = [_]TestObject{
+        .{ .path = dev_a, .iface = device_iface, .props = .{ .uuid_hit = true } },
+        .{ .path = dev_b, .iface = device_iface, .props = .{ .name = strOf(device_name) } },
+        .{ .path = svc_b, .iface = gatt_service_iface, .props = .{ .uuid = strOf(service_uuid), .device = strOf(dev_b) } },
+        .{ .path = chr_b, .iface = char_iface, .props = .{ .uuid = strOf(write_uuid), .service = strOf(svc_b), .flag_write = true } },
+        .{ .path = svc_a, .iface = gatt_service_iface, .props = .{ .uuid = strOf(service_uuid), .device = strOf(dev_a) } },
+        .{ .path = chr_a, .iface = char_iface, .props = .{ .uuid = strOf(write_uuid), .service = strOf(svc_a), .flag_write = true } },
+    };
+
+    var dev: Str = .{};
+    try std.testing.expect(try visitTree(&objects, &FindDevice{ .out = &dev }));
+    try std.testing.expectEqualStrings(dev_a, dev.slice()); // 选中第一台候选设备
+
+    var svc: Str = .{};
+    try std.testing.expect(try visitTree(&objects, &FindService{ .out = &svc, .device = dev.slice() }));
+    try std.testing.expectEqualStrings(svc_a, svc.slice()); // 不是排在前面的 dev_B 服务
+
+    var chr: Str = .{};
+    const wfind = FindCharacteristic{ .out = &chr, .uuid = write_uuid, .service = svc.slice(), .flag = .write };
+    try std.testing.expect(try visitTree(&objects, &wfind));
+    try std.testing.expectEqualStrings(chr_a, chr.slice());
+
+    // 选中另一台设备时仍能各自命中，且只命中自己那棵子树
+    var svc_other: Str = .{};
+    try std.testing.expect(try visitTree(&objects, &FindService{ .out = &svc_other, .device = dev_b }));
+    try std.testing.expectEqualStrings(svc_b, svc_other.slice());
+
+    // 选中设备没有目标服务时不得借用别人的：只保留 dev_B 那棵子树
+    var none: Str = .{};
+    try std.testing.expect(!try visitTree(objects[0..3], &FindService{ .out = &none, .device = dev_a }));
 }
 
 test "读请求编码向量（0x05, offset 0, length 15）" {

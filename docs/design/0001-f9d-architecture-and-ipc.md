@@ -17,7 +17,11 @@
 - **BLE**：`ble.zig`，请求定长 20 字节、响应变长（5 字节头 + length 字节，spec §3 confirmed）；
   经系统 libsystemd 的 sd-bus 直连 BlueZ。
   设备发现以服务 UUID 为主、名称 `LEGION_F9_BT` 为辅（广告可能不含服务 UUID），
-  连接后按 `ServicesResolved`、服务/特征 UUID 与 flags（`write` / `notify`）复核；
+  连接后按 `ServicesResolved`、服务/特征 UUID、服务所属设备（`GattService1.Device`
+  必须等于选中设备路径）与 flags（`write` / `notify`）复核：GetManagedObjects 返回的是
+  全适配器的对象树，只按 UUID 全局查找会在多台同类设备同时在线时把别的设备的服务
+  关联到当前候选设备上（服务限定到选中设备后，特征按所属服务路径随之不跨设备）；
+  真机复核（20260924）：BlueZ 在 GetManagedObjects 中确实给出 `GattService1.Device`；
   名称不作为认证，也不硬编码地址或对象路径。写特征用 `WriteValue(type="request")`
   （write-with-response），不支持即报错，不降级为无响应写。
   普通命令发车前先装 `PropertiesChanged` 订阅，等到命令/长度/offset 都匹配的通知才算完成；
