@@ -1,119 +1,69 @@
 # legion-f9-control
 
-Linux 下控制联想 Legion F9 散热风扇的用户态工具，Zig 实现。读取实时状态
-（flag、风扇转速 RPM），读取与设置挡位（quiet / balanced / beast / turbo）。
+在 Linux 上，不安装 LEGION ZONE，也能查看联想拯救者风刃 F9 散热风扇的转速、切换挡位。`legion-f9-control` 是一套开源的
+Zig 命令行第三方工具，可通过 USB 或蓝牙连接设备。
+
+- **看状态**：读取风扇转速（RPM）和设备状态标志。
+- **调挡位**：查看或切换 quiet、balanced、beast、turbo 四种挡位。
+- **按需接入**：提供 JSON 输出，方便在脚本中读取结果。
+
+**目前仅支持 Linux 下的风刃 F9。**Windows、灯光控制和 F9 Lite 尚未支持。
 
 > [!WARNING]
-> **当前版本 v0.0.0，处于早期开发阶段。不保证 CLI 参数、JSON 输出形状、
-> IPC 协议与内部 API 的任何稳定性，均可能在不预告的情况下破坏性变更。**
-> 真机验收尚未全面覆盖，已知缺口见下文「稳定性与验收状态」。
+> 当前为早期版本（`0.0.0`），命令和输出格式可能变化。调节挡位会影响风扇运行，请确认安全后操作。以 root 启动服务时，**本机所有用户都能控制风扇**；共享主机请谨慎使用。部分场景尚未完成真机验收，见[已知限制](#已知限制)。
 
-## 架构：f9d + f9ctl
+## 快速开始
 
-- **f9d**（daemon）：独占设备，串行执行一切设备流量，经 Unix socket 提供服务。
-  前台运行，生命周期交给 init 系统。会话命令是有状态的，必须单点独占，
-  多点直连会互相破坏读-改-写序列。
-- **f9ctl**（CLI）：纯客户端，只通过 socket 与 f9d 通信，不直接访问设备，
-  无需 root。stdout 只输出结果，诊断日志一律走 stderr。
+目前需要自行编译，暂无现成安装包。准备好 Linux、[mise](https://mise.jdx.dev/) 和 C 编译/链接工具链，并安装 libsystemd 开发文件（例如 `libsystemd-dev` 或 `systemd-devel`）。本项目通过 [`mise.toml`](mise.toml) 固定 Zig `0.15.1`，请勿改用系统 Zig。
 
-链路选择：**USB 优先**（hidraw，VID `17ef` PID `f00c`，64 字节帧）；
-仅当 USB 报「设备不存在 / 无应答」时才回落 **BLE**（BlueZ，设备名
-`LEGION_F9_BT`）；USB 权限、I/O 等其他错误原样上报，不用 BLE 掩盖。
-一次请求只走一条链路，失败不重放写入、不中途换链路；失败后丢弃句柄，
-下个请求惰性重建并重新选择链路（拔插恢复即由此覆盖）。
-
-## 构建
-
-**必须使用 mise 提供的 Zig 0.15.1**（`mise.toml` 钉死 zig 与 zls 版本）。
-系统自带的其他版本 zig 与本项目不兼容，**不要绕过 mise 直接运行 `zig`**。
+在项目目录下构建：
 
 ```sh
-mise install               # 安装锁定版本的 zig / zls
-mise exec -- zig build     # 构建
+mise install
+mise exec -- zig build
 ```
 
-产物：`zig-out/bin/f9d` 与 `zig-out/bin/f9ctl`。BLE 链路经系统
-libsystemd 的 sd-bus 连接 BlueZ，因此构建依赖 libc 与 libsystemd 头文件/库。
+打开**两个终端**。第一个终端启动设备服务 `f9d`（保持运行）：
+```sh
+sudo ./zig-out/bin/f9d
+```
 
-开发时也可直接运行：
+第二个终端运行 `f9ctl`；先试试只读命令，无需 `sudo`：
 
 ```sh
-mise exec -- zig build run -- status        # 构建并运行 f9ctl
-mise exec -- zig build run-f9d              # 构建并运行 f9d
+./zig-out/bin/f9ctl status          # 查看状态和转速
+./zig-out/bin/f9ctl gear            # 查看当前挡位
+./zig-out/bin/f9ctl gear turbo      # 切换到 turbo 挡位
+./zig-out/bin/f9ctl --json status   # 以 JSON 输出状态
 ```
 
-## 运行前提
+挡位还可以指定为 `quiet`（静音）、`balanced`（均衡）、`beast` 或数字 `0`–`3`。`--json` 适用于所有命令；运行 `./zig-out/bin/f9ctl --help` 可查看完整用法。
 
-- **Linux**，且 BLE 链路依赖 **BlueZ**（system bus 可达、适配器已启用）。
-- **USB 访问权限**：f9d 以 root 运行即可；非 root 运行需通过 udev
-  （如 uaccess 标签）授予 hidraw 节点权限。
-- **非 root 开发实例**要求 `XDG_RUNTIME_DIR` 已设置，且目录属主本人、
-  权限不宽于 `0700`，否则 f9d 拒绝启动（不回退 /tmp，防可预测路径占位）。
+连接设备时优先使用 USB；USB 未找到设备或设备无应答时，才会尝试蓝牙。要使用蓝牙，请确保 BlueZ 正在运行、蓝牙适配器已启用且 system bus 可用。USB 连接则要求运行 `f9d` 的用户有权访问设备的 hidraw 节点。
 
-## 用法
+## 可选：手动安装
+
+目前没有安装包、systemd 服务单元或经过验收的一键安装流程。如需从任意目录运行，可以复制编译好的程序；仍需在一个终端保持 `f9d` 运行：
 
 ```sh
-# 1. 启动 daemon（前台运行；root 实例需要 hidraw 权限）
-sudo zig-out/bin/f9d
-
-# 2. 客户端（无需 root）
-zig-out/bin/f9ctl status          # 实时状态：flag、RPM
-zig-out/bin/f9ctl gear            # 读挡位
-zig-out/bin/f9ctl gear turbo      # 写挡位：quiet|balanced|beast|turbo 或 0-3
-zig-out/bin/f9ctl --json status   # JSON 输出（--json 对所有命令有效）
+sudo install -m 0755 zig-out/bin/f9d zig-out/bin/f9ctl /usr/local/bin/
+sudo /usr/local/bin/f9d            # 终端 1
+/usr/local/bin/f9ctl status         # 终端 2
 ```
 
-写挡位是有副作用的操作（open 会话 → 读设置块 → 改挡位字节 → 写入 →
-close → 回读确认），只在确认安全时执行。
+不想以 root 运行？可以为当前登录用户配置 udev/uaccess 权限后，以该用户启动 `f9d`。此时必须设置 `XDG_RUNTIME_DIR`，且目录属于该用户、权限不宽于 `0700`。项目暂未提供通用 udev 规则或用户服务单元，需按发行版验证；也请避免同时启动 root 和用户实例，客户端会优先连接 root 实例。
 
-Socket 行为：
+## 已知限制
 
-| 实例 | 监听路径 | 说明 |
-| --- | --- | --- |
-| root | `/run/f9d/f9d.sock`（0666） | 本地所有用户均可控制风扇 |
-| 非 root 开发 | `$XDG_RUNTIME_DIR/f9d.sock` | 仅本人可连 |
+USB 和蓝牙已在真机上验证状态读取、挡位读写、连续请求和断连恢复，但尚未覆盖全部环境。特别是 USB 权限/I/O 错误、同时连接两台同类蓝牙设备，以及 BlueZ 不可用、蓝牙无通知或响应异常等场景，仍有待真机验收。请勿把当前版本当作稳定接口；详情见[验收记录与后续计划](docs/ROADMAP.md)。
 
-f9ctl 先连系统级路径，失败再连用户级路径。f9d 对 `<socket>.lock` 持排他
-flock 防双开；每连接一请求一响应，单行 JSON。f9ctl 等响应上限 35 秒，
-BLE 单请求预算 30 秒——任何失败都有界，不会无限等待。
+如果无法连接，请先确认 `f9d` 正在运行、设备已开启，且服务有访问设备的权限。错误信息写到终端的 stderr；[故障排查文档](docs/troubleshooting.md)目前尚待完善。
 
-## 测试
+## 了解项目与参与贡献
 
-```sh
-mise exec -- zig build test                      # 全部单元测试（纯函数，无需硬件）
-mise exec -- zig fmt --check src/*.zig build.zig # 格式检查
-```
+`f9d` 负责与设备通信，`f9ctl` 是无需直接访问设备的命令行客户端。设备操作由 `f9d` 串行执行；USB 权限错误不会通过切换到蓝牙来掩盖，同一次请求也不会自动重放写入。更多技术细节见[架构与 IPC](docs/design/0001-f9d-architecture-and-ipc.md)。
 
-## 稳定性与验收状态
-
-**v0.0.0，可能随时破坏性变更；请勿当作稳定接口依赖。**
-
-已完成三轮 BLE/USB 真机验收（状态/挡位读写、连续请求、断连重连、
-USB 拔插、多 hidraw 接口与短通知过滤等，详见
-[docs/ROADMAP.md](docs/ROADMAP.md)），但以下场景**仍未真机验收**：
-
-- USB 权限 / I/O 错误下「不回落 BLE」的行为（仅单测覆盖）；
-- 两台同类 BLE 设备同时在线时的服务/特征归属；
-- BlueZ 未启动、无通知、写特征不支持、真机出现截断响应帧；
-- 部署与发布：systemd 单元、安装说明、打包与版本号策略；
-- [docs/troubleshooting.md](docs/troubleshooting.md) 尚为骨架，条目未补齐。
-
-待定夺事项：设备关闭时 f9d 在有界预算内返回 `Timeout`，f9ctl 文案
-「等待响应超时」易被误读为客户端等待超时，实际语义是连接/服务解析超时，
-文案尚未调整。
-
-## 文档
-
-- [docs/spec/0001-legion-f9-protocols.md](docs/spec/0001-legion-f9-protocols.md) — 硬件协议事实（改动协议行为先改这里）
-- [docs/design/0001-f9d-architecture-and-ipc.md](docs/design/0001-f9d-architecture-and-ipc.md) — f9d/f9ctl 架构与 IPC 协议
-- [docs/design/0002-f9d-ble-link.md](docs/design/0002-f9d-ble-link.md) — BLE 链路实现边界与验收记录
-- [docs/ROADMAP.md](docs/ROADMAP.md) — 里程碑、真机验收记录与未验收项
-- [docs/troubleshooting.md](docs/troubleshooting.md) — 故障排查（骨架）
-
-## Legacy（旧 Rust 实现）
-
-本项目最初由 Rust 实现，现已冻结在 **`legacy` 分支**，仅作存档与移植参考，
-不再维护。当前 `main` 是从零重写的 Zig 版本，与 Rust 版无代码共享。
+想参与开发？请从[贡献指南](CONTRIBUTING.md)开始；协议事实见[硬件协议文档](docs/spec/0001-legion-f9-protocols.md)，BLE 实现记录见[设计文档](docs/design/0002-f9d-ble-link.md)。旧 Rust 实现冻结在 `legacy` 分支，仅供参考；当前版本为 Zig 重写版。
 
 ## 许可证
 
