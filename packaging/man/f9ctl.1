@@ -1,0 +1,85 @@
+.TH F9CTL 1 "2026-11-25" "legion-f9-control 0.1.0" "User Commands"
+.SH NAME
+f9ctl \- 联想想拯救者风刃 F9 散热风扇的状态读取与挡位切换
+.SH SYNOPSIS
+.B f9ctl
+[\fI选项\fR] \fBstatus\fR
+.br
+.B f9ctl
+[\fI选项\fR] \fBgear\fR
+[\fI挡位\fR]
+.SH DESCRIPTION
+.B f9ctl
+是
+.BR f9d (1)
+的客户端，经 Unix socket 收发单行请求，不直接访问设备。stdout 只输出结果，
+诊断信息写到 stderr。必须先启动
+.BR f9d 。
+.PP
+设备链路由
+.B f9d
+选择：USB 优先，仅在 USB 未找到设备或无应答时回落蓝牙。同一次请求不会换链路，
+也不会重放写入。
+.SH COMMANDS
+.TP
+.B status
+读取实时状态标志与风扇转速（RPM）。
+.TP
+.B gear
+读取当前挡位。
+.TP
+.BI gear " 挡位"
+设置挡位并回读确认。挡位可写
+.BR quiet "、" balanced "、" beast "、" turbo
+或数字
+.BR 0 "\-\ " 3 。
+.SH OPTIONS
+.TP
+.B \-\-json
+以 JSON 输出结果（字段与 IPC 响应一致）。
+.TP
+.BI \-\-link " usb|ble"
+只走指定链路，不回落另一条。用于验收与排查（例如确认 USB 权限错误不会掩盖成蓝牙回退）。
+.TP
+.BI \-\-socket " 路径"
+连接指定的 f9d socket，默认
+.B /run/f9d/f9d.sock
+（root 实例）或
+.B $XDG_RUNTIME_DIR/f9d.sock
+（用户实例）。
+.TP
+.BR \-h ", " \-\-help
+显示用法。
+.TP
+.BR \-V ", " \-\-version
+显示版本。
+.SH EXIT STATUS
+.TP
+.B 0
+成功。
+.TP
+.B 1
+运行期错误（设备、权限、超时、IPC 等）；具体文案与含义见故障排查文档。
+.TP
+.B 2
+参数错误（未知选项/命令、无效挡位）。
+.SH EXAMPLES
+.PP
+.nf
+f9ctl status
+f9ctl gear turbo
+f9ctl --json status
+f9ctl --link usb gear
+.fi
+.SH FILES
+.TP
+.B /run/f9d/f9d.sock
+root 实例的 socket（0666，本地用户均可控制风扇）。
+.TP
+.B $XDG_RUNTIME_DIR/f9d.sock
+非 root 开发实例的 socket；目录须属主本人且权限不宽于 0700。
+.SH SEE ALSO
+.BR f9d (1),
+.BR systemctl (1)
+.PP
+项目文档：README、docs/troubleshooting.md、docs/ROADMAP.md（仓库内）。

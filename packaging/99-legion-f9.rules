@@ -1,0 +1,6 @@
+# Lenovo Legion F9 (17ef:f00c) hidraw 访问权限
+#
+# 默认只有 root 能读写 /dev/hidraw*。安装本规则后，正在登录的本地会话用户
+# 会通过 systemd-logind 的 uaccess 获得该设备的 ACL，从而以本人身份运行 f9d。
+# 需要 systemd-udevd 与 logind；没有 logind 的环境请改用 MODE/GROUP（见 README）。
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="17ef", ATTRS{idProduct}=="f00c", TAG+="uaccess"

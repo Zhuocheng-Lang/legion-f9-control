@@ -1,0 +1,14 @@
+#compdef f9ctl
+# zsh 补全：安装到 /usr/share/zsh/site-functions/_f9ctl
+_f9ctl() {
+    _arguments -s -S \
+        '--json[以 JSON 输出结果]' \
+        '--link=[只走指定链路（不回落）]:链路:(usb ble)' \
+        '--socket=[连接指定 socket]:路径:_files' \
+        '(-h --help)'{-h,--help}'[显示帮助]' \
+        '(-V --version)'{-V,--version}'[显示版本]' \
+        '1:命令:(status gear)' \
+        '2:挡位:(quiet balanced beast turbo 0 1 2 3)'
+}
+
+_f9ctl "$@"

@@ -1,0 +1,33 @@
+[Unit]
+Description=Legion F9 fan control daemon (f9d)
+Documentation=man:f9ctl(1) https://github.com/Zhuocheng-Lang/legion-f9-control
+# 蓝牙只是 USB 的回落链路：BlueZ 未启动时 daemon 仍可工作，不要因此阻塞启动
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/f9d
+# 拔插/断链后由 daemon 自己惰性重开；进程异常退出由 init 拉起
+Restart=always
+RestartSec=2
+# 运行期只写 /run/f9d（socket 与锁文件）；设备与 system bus 通过 ReadWritePaths 之外的内核接口访问
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict 会把 /run 一起挂成只读，因此 socket 目录必须显式放行。
+# ReadWritePaths 不会创建目录：没有 RuntimeDirectory 时 /run/f9d 不存在，
+# 单元会在挂载命名空间阶段直接失败（226/NAMESPACE），f9d 根本没机会自己 mkdir。
+RuntimeDirectory=f9d
+RuntimeDirectoryMode=0755
+ReadWritePaths=/run/f9d
+# f9d 只用 Unix socket（IPC）与 AF_BLUETOOTH（BlueZ 由 system bus 代理）
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
+# 日志走 stderr，由 journald 收集
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=f9d
+
+[Install]
+WantedBy=multi-user.target
