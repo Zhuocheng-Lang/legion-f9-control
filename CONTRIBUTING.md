@@ -12,27 +12,37 @@ mise exec -- zig build
 mise exec -- zig build test
 ```
 
-构建和纯函数单元测试不需要连接风扇。运行程序的方法见 [README 的快速上手](README.md#从源码运行)。
+构建和纯函数单元测试不需要连接风扇，也不连接 system bus（BLE 的 sd-bus 编解码测试使用离线 socketpair 构造消息）。运行程序的方法见 [README 的快速开始](README.md#快速开始)。
 
 ## 修改代码与文档
 
-1. 先确定改动属于协议事实、USB/BLE 链路、业务操作、IPC 还是 CLI；保持 `f9d` 独占设备、请求串行，`f9ctl` 只做客户端。尽量在现有模块中完成改动，不增加无用的命令、依赖或通用框架。
+1. 先确定改动属于协议事实、USB/BLE 链路、业务操作、IPC 还是 CLI；保持 `f9d` 独占设备、设备请求串行（连接处理可并发，但设备访问必须经同一把锁），`f9ctl` 只做客户端。尽量在现有模块中完成改动，不增加无用的命令、依赖或通用框架。
 2. 改动帧形状、校验、会话语义或链路选择时，先更新 `docs/spec/` 中对应的协议事实及确认状态（`confirmed`、`inferred`、`unknown`），再修改实现和测试；架构决策同步更新 `docs/design/`。没有真机证据时不要推断字段意义或宣称通过真机验收。
-3. 为变更添加最小的可离线运行的测试，覆盖正常路径和关键错误路径；不要让 `zig build test` 依赖真实设备或 system bus。改动用户可见行为时同步更新 README，未验收/已知限制同步更新 [ROADMAP](docs/ROADMAP.md)。
+3. 为变更添加最小的可离线运行的测试，覆盖正常路径和关键错误路径；不要让 `zig build test` 依赖真实设备或 system bus。改动用户可见行为时同步更新 README 与 `CHANGELOG.md`，未验收/已知限制同步更新 [ROADMAP](docs/ROADMAP.md)。
 4. 注释、文档、提交说明使用中文；保留代码标识符、协议字段和 Conventional Commits 类型的原样拼写。stdout 仅用于结果，错误/诊断写 stderr。
+5. 新增或修改用户可见的命令行选项时，同步更新 `packaging/completions/` 与 `packaging/man/f9ctl.1`；涉及系统集成（systemd/udev）时更新 `packaging/` 并在 README 说明。
 
 真机测试可能改变风扇行为：写入前确认设备与环境安全。若无法进行真机验证，只报告离线结果与未验收项；记录证据时脱敏，**不要提交真实 BLE 地址、设备日志原文、抓包、私有资料或凭证**。
 
 ## 提交前检查
 
-在仓库根目录运行：
+在仓库根目录运行一条命令即可执行全部离线检查：
+
+```sh
+mise run check
+```
+
+它等价于：
 
 ```sh
 mise exec -- zig fmt --check src/*.zig build.zig
 mise exec -- zig build test
 mise exec -- zig build
+./tools/check-sensitive.sh
 git diff --check
 ```
+
+`tools/check-sensitive.sh` 会检查被跟踪文件中的设备地址、抓包/私有材料、常见凭证与 `.env`；CI（`.github/workflows/ci.yml`）执行同样的检查，并额外验证 `zig build install --prefix` 的安装布局。
 
 如有文档改动，核对示例命令与当前实现、相对链接与风险提示。按改动范围检查差异与暂存文件，避免加入 `.legacy/`、本地环境文件或 `zig-out/`、`.zig-cache/`。未运行或失败的检查请在提交/合并请求说明中明确标注，不要把离线测试写作真机验收。
 

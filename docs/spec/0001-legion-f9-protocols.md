@@ -34,21 +34,31 @@
 
 - 响应状态：`0x00` 成功、`0xfe` 忙、`0xff` 错误。
 - 响应定长 64 字节：解码器要求帧长恰为 64，不足的截断帧一律判为长度错误
-  （即使其声明长度在帧内自洽也不接受）；在此基础上检查 report ID、command 回显与
-  状态，不得索引短包。
+  （即使其声明长度在帧内自洽也不接受）；在此基础上检查 report ID、校验和、
+  command 回显与状态，不得索引短包。
+- **校验和由主机强制校验**（实现约束）：`[1:2]` 必须等于 `sum(bytes[3..63])`。
+  失配说明帧在传输中损坏（或不是本协议帧），必须以独立错误（`BadChecksum`）上报；
+  它既不是“设备没回”，也不能被静默丢弃后报成超时。
+- **offset/长度回显**：读命令 `inferred` —— 真机 `0x1a` 读向量
+  （`04 1d 00 | 1a | 03 | 0000 | 00 | …`）中，响应的长度与 offset 与请求一致；
+  v1 的读都请求完整数据（3 或 15 字节，offset 0），因此按“回显必须一致”判定：
+  不一致的帧视为**旧响应**，丢弃后继续等本次响应（与 BLE 的
+  `LengthMismatch`/`OffsetMismatch` 处理一致），不判死整个事务。
+  写命令与会话命令的回显形状 `unknown`：v1 不据此判错（写总是 offset 0、长度固定，
+  回显校验对识别旧帧没有帮助）。
+  若真机出现“短读”或不同的回显约定，先把本条改为对应状态再放松实现。
 - **hidraw 节点是多路复用的** `confirmed`（真机 2026-09-24）：接口描述符同时声明键盘
   （report 1，16 字节）、消费者控制（report 3，3 字节）、鼠标（report 6）等其他报告，
   设备还会**主动推送 report 3 短通知**（实测：挡位写入提交后约 50ms 出现；拔插/重连后
-  也可能读到残留帧）。因此事务层的响应判据是“report ID 4 + 恰 64 字节 + 命令回显为
-  本次请求”：**report ID 非 4、长度非 64、或回显不符的帧一律视为非本次响应，丢弃后
-  继续等到期限**（否则短通知会被误报成协议违规并让整条链路失败）。截断的“响应”同理
-  不被接受，最终表现为超时，而不是被当作结果。
+  也可能读到残留帧）。因此事务层的响应判据是“report ID 4 + 恰 64 字节 + 校验和正确 +
+  command 回显为本次请求（读命令还要求 offset/长度一致）”：不符合的帧一律视为非本次响应，
+  丢弃后继续等到期限。期限用尽时：
+    - 只见过 report ID 4 形状的帧（截断响应、异命令旧响应、回显不符）→ `BadResponse`；
+    - 完全没有协议帧（只有短通知/键盘报告或根本没数据）→ `Timeout`。
+  这样“设备没回”与“设备回了坏帧/旧帧”在错误码上可区分。
   描述符证据：report ID 4 声明 8bit×63 的输入/输出报告（含 report ID 恰为 64 字节），
   report ID 5 为 32 字节。
 - report ID 5 一律拒绝（不属于本协议实现的任何合法收发路径）。
-- offset/长度回显的请求一致性 `unknown`：本节解码只校验帧长（恰为 64）与声明长度合法，
-  不回比请求的 offset 与期望长度；BLE 则全对称校验（`OffsetMismatch`/
-  `LengthMismatch`，§3）。两链路不对称是已知现状，v1 不在 USB 侧新增校验。
 
 ## 3. BLE 帧 `confirmed`
 
@@ -69,20 +79,25 @@ response: [0]=0xee [1]=command [2]=length [3:4]=offset LE [5:5+length]=data（�
 - 支持集：`0x01`、`0x02`、`0x03`、`0x04`、`0x05`、`0x06`、`0x0d`、`0x1a`、`0x20`。
 - BLE 写特征使用 write-with-response；不静默降级。
 
-## 4. 命令表
+## 4. 命令表与 v1 暴露范围
 
-| 命令 | 名称 | 状态 | v1 用途 |
+| 命令 | 名称 | 协议状态 | v1 用途 |
 | --- | --- | --- | --- |
 | `0x01` | session open | confirmed | 写配置前打开会话（BLE fire-and-forget） |
 | `0x02` | session close | confirmed | 关闭/提交会话（BLE fire-and-forget） |
-| `0x03` | info page | confirmed | 读取信息页 |
-| `0x05` | settings read | confirmed | 分块读取设置 |
-| `0x06` | settings write | confirmed | 分块写设置 |
+| `0x03` | info page | confirmed | 未暴露：页长度与字段布局未确认，v1 不猜测语义 |
+| `0x05` | settings read | confirmed | 分块读取设置（v1 只读 0–14 字节） |
+| `0x06` | settings write | confirmed | 分块写设置（v1 只写 0–14 字节） |
 | `0x1a` | live status | confirmed | 读取 flag 与 RPM |
-| `0x1d` | device info | confirmed | 仅 USB 正常使用 |
+| `0x1d` | device info | confirmed | 未暴露：仅 USB 可用，字段布局未确认 |
 | `0x04` | unknown | unknown | v1 不调用 |
 | `0x0d` | unknown | unknown | v1 不调用 |
 | `0x20` | 灯效写（inferred） | inferred | v1 正常命令不暴露；raw 写默认拒绝 |
+
+v1 有意不暴露 `0x03`/`0x1d`/`0x20`/`0x04`/`0x0d`：没有真机样本能确认页长度、
+分块读语义与字段布局，按项目约束“不得猜测未确认的设备行为”，也不新增无用途的命令
+（Windows、灯光控制、F9 Lite、温控循环、配置文件与模拟器同样不在 v1 范围）。
+需要时先采集脱敏样本、更新本表状态，再实现命令与 CLI。
 
 ## 5. 状态解码 `confirmed`
 
@@ -95,7 +110,7 @@ rpm     = rpm_raw >> 2
 ```
 
 未知尾部只能以 `unknown_fields`/原始十六进制形式展示，不得赋予未经证实的语义；
-f9ctl v1 不输出未知尾部。
+f9ctl v1 不输出未知尾部（读取长度固定为 3，不请求尾部）。
 
 ## 6. 设置块与挡位 `confirmed`
 
@@ -105,6 +120,8 @@ f9ctl v1 不输出未知尾部。
 byte[13] = gear
 0 quiet / 1 balanced / 2 beast / 3 turbo
 ```
+
+其余 14 字节 v1 不解释、不修改：写入时按读-改-写原样回写，保留固件私有字段。
 
 ## 7. 会话命令会话语义 `confirmed`（真机验收已复核）
 
@@ -130,4 +147,6 @@ flag=02, rpm_raw=0x1FF4 → rpm = 0x1FF4 >> 2 = 2045
 ```text
 # BLE 状态响应（0x1a, length 3）：变长帧共 8 字节
 ee 1a 03 0000 | 01 0d 27  →  flag=01, rpm_raw=0x270D, rpm=2499
+# USB 状态响应（0x1a, length 3）：定长 64 字节，长度/offset 回显与请求一致
+04 1d 00 | 1a | 03 | 0000 | 00 | …
 ```
