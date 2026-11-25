@@ -5,6 +5,9 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const monoMs = @import("root.zig").monoMs;
 const log = @import("root.zig").log;
+// 测试用：把诊断输出改道，避免 zig build test 被 errno/日志断言之外的噪声刷屏
+const setLogSink = @import("root.zig").setLogSink;
+const discardLog = @import("root.zig").discardLog;
 
 /// Lenovo Legion F9（有线）的 USB 标识。
 const vid = 0x17ef;
@@ -40,9 +43,19 @@ pub const Device = struct {
             matched = true;
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const path = try std.fmt.bufPrint(&path_buf, "/dev/{s}", .{entry.name});
-            const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| {
-                if (err == error.AccessDenied) denied = true;
-                continue;
+            const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| switch (err) {
+                // 权限问题优先报告，比“无应答”更可操作
+                error.AccessDenied => {
+                    denied = true;
+                    continue;
+                },
+                // 枚举 sysfs 到打开节点之间设备被拔掉：与“设备不在”同义，不是环境故障
+                error.FileNotFound => continue,
+                // 节点忙、I/O 故障等必须上报：吞掉会被误判成“接口无应答”而错误回落 BLE
+                else => {
+                    if (env_err == null) env_err = err;
+                    continue;
+                },
             };
             const dev = probe(file) catch |err| {
                 file.close();
@@ -56,7 +69,7 @@ pub const Device = struct {
             return dev;
         }
         // 权限问题优先报告，比“无应答”更可操作；其次探测中撞上的环境错误
-        if (denied) return error.AccessDenied;
+        if (denied) return error.UsbAccessDenied;
         if (env_err) |err| return err;
         return if (matched) error.DeviceNotResponding else error.DeviceNotFound;
     }
@@ -65,31 +78,64 @@ pub const Device = struct {
         dev.file.close();
     }
 
+    /// 静态检查是否存在本项目的 hidraw 接口（读 sysfs，不打开、不发帧）。
+    /// daemon 复用 BLE 链路时用它发现“后插入的 USB”，避免每请求做一次探测事务。
+    pub fn present() bool {
+        return presentAt("/sys/class/hidraw") catch false;
+    }
+
+    fn presentAt(sys_class_hidraw: []const u8) !bool {
+        var dir = std.fs.openDirAbsolute(sys_class_hidraw, .{ .iterate = true }) catch |err| switch (err) {
+            // 无 hidraw 子系统 = 没有设备节点
+            error.FileNotFound => return false,
+            else => |e| return e,
+        };
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (try isTarget(dir, entry.name)) return true;
+        }
+        return false;
+    }
+
+    /// 句柄是否仍然可用：零超时 poll 看挂断/错误事件（拔线后 hidraw 报 POLLERR/POLLHUP）。
+    /// 只查内核状态、不发帧，供 daemon 在复用链路前预检，避免用户请求先失败一次。
+    pub fn alive(dev: Device) bool {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = dev.file.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(&fds, 0) catch return false;
+        return fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) == 0;
+    }
+
     /// 一次事务：写请求帧 → 等本次响应帧 → 解码校验。
-    pub fn transact(dev: Device, req: *const [protocol.frame_len]u8, expect: protocol.Command) !protocol.Decoded {
+    pub fn transact(dev: Device, req: *const [protocol.frame_len]u8, command: protocol.Command, want: protocol.Expect) !protocol.Decoded {
         var g = HidFrames{ .file = dev.file };
-        return exchange(&g, req, expect, monoMs() + response_timeout_ms);
+        return exchange(&g, req, command, want, monoMs() + response_timeout_ms);
     }
 
     /// 读命令：与 BLE 链路同形语义，帧与事务由本层实现。
+    /// 读是唯一会变 offset/长度的命令，回显参与判定（见 exchange）。
     pub fn read(dev: Device, command: protocol.Command, offset: u16, len: u8) !protocol.Decoded {
         var req: [protocol.frame_len]u8 = undefined;
         try protocol.encodeRead(&req, command, offset, len);
-        return dev.transact(&req, command);
+        return dev.transact(&req, command, .{ .offset = offset, .len = len });
     }
 
-    /// 写命令。
+    /// 写命令。写响应是否回显 offset/长度在真机未确认（spec §2），不据此判错。
     pub fn write(dev: Device, command: protocol.Command, offset: u16, payload: []const u8) !void {
         var req: [protocol.frame_len]u8 = undefined;
         try protocol.encodeWrite(&req, command, offset, payload);
-        _ = try dev.transact(&req, command);
+        _ = try dev.transact(&req, command, .{});
     }
 
     /// 会话命令（USB 上同样要等响应帧，与 BLE 的 fire-and-forget 不同）。
     pub fn session(dev: Device, is_open: bool) !void {
         var req: [protocol.frame_len]u8 = undefined;
         try protocol.encodeSession(&req, is_open);
-        _ = try dev.transact(&req, if (is_open) .session_open else .session_close);
+        _ = try dev.transact(&req, if (is_open) .session_open else .session_close, .{});
     }
 };
 
@@ -131,7 +177,8 @@ fn errnoError(e: std.posix.E) anyerror {
         .NODEV, .NXIO, .PROTO, .SHUTDOWN => return error.NoDevice,
         .IO => return error.InputOutput,
         .NOENT => return error.FileNotFound,
-        .ACCES, .PERM => return error.AccessDenied,
+        // 与 BLE 的权限错误分开命名：用户能直接看出是 hidraw 还是 system bus 被拒
+        .ACCES, .PERM => return error.UsbAccessDenied,
         .NOSPC => return error.NoSpaceLeft,
         .BUSY => return error.DeviceBusy,
         .AGAIN => return error.WouldBlock,
@@ -172,7 +219,7 @@ fn probe(file: std.fs.File) !Device {
     var req: [protocol.frame_len]u8 = undefined;
     try protocol.encodeRead(&req, .live_status, 0, 3);
     var g = HidFrames{ .file = file };
-    _ = try exchange(&g, &req, .live_status, monoMs() + probe_timeout_ms);
+    _ = try exchange(&g, &req, .live_status, .{ .offset = 0, .len = 3 }, monoMs() + probe_timeout_ms);
     return .{ .file = file };
 }
 
@@ -182,17 +229,25 @@ fn probe(file: std.fs.File) !Device {
 /// （键盘/鼠标/消费者）与设备主动推送的短通知（真机实测：挡位写入后约 50ms 出现
 /// 3 字节 report 3 通知），旧响应也可能残留在队列里。这些“不是本次响应”的帧
 /// 一律丢弃后继续等，直到单调时钟期限用尽（与 BLE 事务丢弃旧通知的判定一致）。
-fn exchange(g: anytype, req: *const [protocol.frame_len]u8, expect: protocol.Command, deadline_ms: i64) !protocol.Decoded {
+fn exchange(g: anytype, req: *const [protocol.frame_len]u8, expect: protocol.Command, want: protocol.Expect, deadline_ms: i64) !protocol.Decoded {
     try g.writeFrame(req);
+    // 丢弃过“协议形状”的帧（report ID 4）时记下来：期限到了仍无有效响应，
+    // 报 BadResponse 而不是 Timeout，用户才能区分“设备没回”与“回了坏帧/旧帧”。
+    var saw_protocol_frame = false;
     while (true) {
         const remaining = deadline_ms - monoMs();
-        if (remaining <= 0) return error.Timeout;
-        const raw = try g.nextFrame(@intCast(@min(remaining, std.math.maxInt(i32))));
-        return protocol.decodeResponse(raw, expect) catch |err| switch (err) {
-            // 没有 report ID 4、长度不是 64、命令不是本次请求：都不是本次响应
-            // （异物报告 / 短通知 / 截断帧 / 旧响应），丢弃继续等
-            error.BadReportId, error.BadLength, error.CommandMismatch => continue,
-            // 设备确实用本次命令回了话：忙/错误/未知状态是真实结论，不得吞掉
+        if (remaining <= 0) return if (saw_protocol_frame) error.BadResponse else error.Timeout;
+        const raw = g.nextFrame(@intCast(@min(remaining, std.math.maxInt(i32)))) catch |err| switch (err) {
+            // 期限用尽：据是否见过协议形状的帧给出可区分的结论
+            error.Timeout => return if (saw_protocol_frame) error.BadResponse else error.Timeout,
+            else => |e| return e,
+        };
+        if (raw.len > 0 and raw[0] == protocol.report_id) saw_protocol_frame = true;
+        return protocol.decodeResponse(raw, expect, want) catch |err| switch (err) {
+            // 不是本次响应：异物报告 / 短通知 / 截断帧 / 旧响应（命令或 offset/长度不符）。
+            // 丢弃继续等；hidraw 是非阻塞读，队列里可能还排着真正的响应。
+            error.BadReportId, error.BadLength, error.CommandMismatch, error.LengthMismatch, error.OffsetMismatch => continue,
+            // 设备确实用本次命令回了话：忙/错误/未知状态/校验和损坏是真实结论，不得吞掉
             else => |e| return e,
         };
     }
@@ -207,7 +262,9 @@ fn exchange(g: anytype, req: *const [protocol.frame_len]u8, expect: protocol.Com
 /// 设备报错”误报成“设备不在”。
 fn probeSkippable(err: anyerror) bool {
     return switch (err) {
-        error.Timeout, error.NoDevice => true,
+        // 探测层的“无应答”包含两种有界结论：完全没有帧（Timeout），或只收到坏帧/旧帧
+        // （BadResponse）。两者都只说明这个接口不是协议接口，试下一个。
+        error.Timeout, error.BadResponse, error.NoDevice => true,
         else => false,
     };
 }
@@ -252,19 +309,34 @@ test "匹配 uevent 中的 HID_ID" {
     try std.testing.expect(!matchVidPid("HID_NAME=LEGION_F9_Wired\n"));
 }
 
+test "uevent 匹配：大小写、字段缺失/非法与 PID 不符都不误判" {
+    // 十六进制大小写都按同一数值解析（内核输出大写，手工样本可能是小写）
+    try std.testing.expect(matchVidPid("HID_ID=0003:000017ef:0000f00c\n"));
+    // HID_ID 不必在第一行，尾部多余字段不影响判定
+    try std.testing.expect(matchVidPid("HID_NAME=x\nHID_ID=0003:000017EF:0000F00C\nDRIVER=hid-generic\n"));
+    try std.testing.expect(matchVidPid("HID_ID=0003:000017EF:0000F00C:1\n"));
+
+    try std.testing.expect(!matchVidPid("HID_ID=0003:000017EF\n")); // 缺 PID
+    try std.testing.expect(!matchVidPid("HID_ID=0003:000017EF:0000F00D\n")); // 同厂不同型
+    try std.testing.expect(!matchVidPid("HID_ID=0003:ZZZZZZ:0000F00C\n")); // 非十六进制
+    try std.testing.expect(!matchVidPid("")); // 空 uevent
+}
+
 test "探测失败分类：仅无应答/设备已拔可跳过，设备报错与权限/IO 错误必须上报" {
     try std.testing.expect(probeSkippable(error.Timeout));
+    try std.testing.expect(probeSkippable(error.BadResponse)); // 只收到坏帧/旧帧：接口不对
     try std.testing.expect(probeSkippable(error.NoDevice));
     try std.testing.expect(!probeSkippable(error.Busy));
     try std.testing.expect(!probeSkippable(error.DeviceError));
     try std.testing.expect(!probeSkippable(error.BadStatus));
-    try std.testing.expect(!probeSkippable(error.AccessDenied));
+    try std.testing.expect(!probeSkippable(error.BadChecksum));
+    try std.testing.expect(!probeSkippable(error.UsbAccessDenied));
     try std.testing.expect(!probeSkippable(error.InputOutput));
     try std.testing.expect(!probeSkippable(error.FileNotFound));
 }
 
 /// 在 tmpdir 里造一个假 hidraw 条目；条目名决定设备节点路径（/dev/{name}）。
-/// 名字 `null` / `full` 分别映射到 /dev/null、/dev/full，用真实内核行为模拟
+/// 名字 null / full 分别映射到 /dev/null、/dev/full，用真实内核行为模拟
 /// “无应答（EOF）”与“写入 I/O 错误”，无需 root、也无需真机。
 fn makeFakeInterface(tmp: std.testing.TmpDir, name: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -297,15 +369,66 @@ test "枚举：probe 的 I/O 错误原样上报，不被“无应答接口”吞
     try std.testing.expectError(error.NoSpaceLeft, Device.openFrom(try tmp.dir.realpath(".", &buf)));
 }
 
+test "枚举：打开设备节点的非权限错误原样上报，不被“接口无应答”掩盖" {
+    // /dev/shm 是目录：打开必然失败（EISDIR），模拟“节点在但打不开”的环境故障
+    std.fs.accessAbsolute("/dev/shm", .{}) catch return error.SkipZigTest;
+    const log_prev = setLogSink(discardLog);
+    defer _ = setLogSink(log_prev);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeFakeInterface(tmp, "shm");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectError(error.IsDir, Device.openFrom(try tmp.dir.realpath(".", &buf)));
+}
+
+test "present：只按 sysfs 判断接口在不在（不打开、不发帧）" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buf);
+    try std.testing.expect(!try Device.presentAt(dir)); // 空目录
+    try makeFakeInterface(tmp, "null");
+    try std.testing.expect(try Device.presentAt(dir)); // 有 HID_ID 匹配的节点
+    try std.testing.expect(!try Device.presentAt("/nonexistent-hidraw"));
+}
+
+test "alive：正常句柄可用，挂断（POLLHUP）与已关闭（POLLNVAL）报不可用" {
+    // 管道：关写端后读端得到 POLLHUP，正是拔线后 hidraw 报的挂断事件。
+    // 只用“关掉 fd”测不到这条路径——那只会得到 POLLNVAL。
+    const fds = try std.posix.pipe();
+    const hung_up: Device = .{ .file = .{ .handle = fds[0] } };
+    defer hung_up.file.close();
+    try std.testing.expect(hung_up.alive());
+    std.posix.close(fds[1]);
+    try std.testing.expect(!hung_up.alive());
+
+    // 已关闭的 fd：poll 报 POLLNVAL，同样视为“不可复用”
+    const f = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .read_write });
+    const closed: Device = .{ .file = f };
+    try std.testing.expect(closed.alive());
+    f.close();
+    try std.testing.expect(!closed.alive());
+}
+
 test "errno 翻译：拔线相关错误码归为 NoDevice（可诊断、探测可跳过），其余按语义分类" {
+    const log_prev = setLogSink(discardLog); // 未建模 errno 会记一行日志
+    defer _ = setLogSink(log_prev);
     try std.testing.expectEqual(@as(anyerror, error.NoDevice), errnoError(.PROTO)); // 真机拔线实测
     try std.testing.expectEqual(@as(anyerror, error.NoDevice), errnoError(.NODEV));
     try std.testing.expectEqual(@as(anyerror, error.NoDevice), errnoError(.NXIO));
     try std.testing.expectEqual(@as(anyerror, error.NoDevice), errnoError(.SHUTDOWN));
     try std.testing.expectEqual(@as(anyerror, error.InputOutput), errnoError(.IO));
-    try std.testing.expectEqual(@as(anyerror, error.AccessDenied), errnoError(.ACCES));
+    try std.testing.expectEqual(@as(anyerror, error.UsbAccessDenied), errnoError(.ACCES));
+    try std.testing.expectEqual(@as(anyerror, error.UsbAccessDenied), errnoError(.PERM));
     try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), errnoError(.NOSPC));
+    try std.testing.expectEqual(@as(anyerror, error.FileNotFound), errnoError(.NOENT));
+    try std.testing.expectEqual(@as(anyerror, error.DeviceBusy), errnoError(.BUSY));
+    try std.testing.expectEqual(@as(anyerror, error.WouldBlock), errnoError(.AGAIN));
     try std.testing.expectEqual(@as(anyerror, error.Unexpected), errnoError(.INVAL));
+    // 权限错误必须上报（回落 BLE 会掩盖“没有 udev uaccess 规则”这一可操作信息）
+    try std.testing.expect(!probeSkippable(errnoError(.ACCES)));
+    try std.testing.expect(!probeSkippable(errnoError(.IO)));
     // 拔线错误在探测阶段必须可跳过，否则会以“未预期的系统错误”挡掉 BLE 回落
     try std.testing.expect(probeSkippable(errnoError(.PROTO)));
 }
@@ -317,7 +440,7 @@ test "exchange：poll 可读但读到 0 字节（拔线 EOF）报 NoDevice" {
     var req: [protocol.frame_len]u8 = undefined;
     try protocol.encodeRead(&req, .live_status, 0, 3);
     var g = HidFrames{ .file = f };
-    try std.testing.expectError(error.NoDevice, exchange(&g, &req, .live_status, monoMs() + 100));
+    try std.testing.expectError(error.NoDevice, exchange(&g, &req, .live_status, .{}, monoMs() + 100));
 }
 
 /// 记录写入帧、按序吐出输入帧的 fake；帧用尽即报期限用尽（Timeout）。
@@ -342,14 +465,16 @@ const FakeFrames = struct {
     }
 };
 
-/// 构造 64 字节响应帧（测试用；decodeResponse 不校验校验和）。
-fn responseFrame(buf: *[protocol.frame_len]u8, command: protocol.Command, status: u8, data: []const u8) []const u8 {
+/// 构造 64 字节响应帧（含有效校验和；测试需要改字段时改完须重新 stampChecksum）。
+fn responseFrame(buf: *[protocol.frame_len]u8, command: protocol.Command, offset: u16, status: u8, data: []const u8) []const u8 {
     @memset(buf, 0);
     buf[0] = protocol.report_id;
     buf[3] = @intFromEnum(command);
     buf[4] = @intCast(data.len);
+    std.mem.writeInt(u16, buf[5..7], offset, .little);
     buf[7] = status;
     @memcpy(buf[8..][0..data.len], data);
+    protocol.stampChecksum(buf);
     return buf;
 }
 
@@ -362,11 +487,11 @@ fn readReq() [protocol.frame_len]u8 {
 test "事务：跳过设备主动推送的短通知，拿到真正的 64 字节响应" {
     const notif = [_]u8{ 0x03, 0x03, 0x04 }; // 真机 report 3 短通知（3 字节）
     var resp: [protocol.frame_len]u8 = undefined;
-    const r = responseFrame(&resp, .live_status, 0x00, &.{ 0x01, 0xf4, 0x1f });
+    const r = responseFrame(&resp, .live_status, 0, 0x00, &.{ 0x01, 0xf4, 0x1f });
 
     var fake: FakeFrames = .{ .frames = &.{ &notif, r } };
     const req = readReq();
-    const d = try exchange(&fake, &req, .live_status, monoMs() + 100);
+    const d = try exchange(&fake, &req, .live_status, .{ .offset = 0, .len = 3 }, monoMs() + 100);
     try std.testing.expectEqual(@as(u8, 3), d.len);
     try std.testing.expectEqualSlices(u8, &.{ 0x01, 0xf4, 0x1f }, d.bytes());
     try std.testing.expectEqual(@as(usize, 1), fake.write_count); // 请求只发一次，不重放
@@ -374,48 +499,104 @@ test "事务：跳过设备主动推送的短通知，拿到真正的 64 字节�
 
 test "事务：跳过键盘报告与旧命令响应，只采纳本次响应" {
     // 真机 hidraw 节点同时承载键盘（report 1，16 字节）等其他报告
-    const keyboard = [_]u8{0x01} ++ [_]u8{0xA5} ** 15;
+    var keyboard = std.mem.zeroes([16]u8);
+    keyboard[0] = 0x01;
+    @memset(keyboard[1..], 0xA5);
+    var stale_payload = std.mem.zeroes([protocol.settings_len]u8);
+    @memset(&stale_payload, 0xAB);
     var stale_buf: [protocol.frame_len]u8 = undefined;
-    const stale = responseFrame(&stale_buf, .settings_read, 0x00, &[_]u8{0xAB} ** 15);
+    const stale = responseFrame(&stale_buf, .settings_read, 0, 0x00, &stale_payload);
     var ok_buf: [protocol.frame_len]u8 = undefined;
-    const ok = responseFrame(&ok_buf, .live_status, 0x00, &.{ 0x02, 0xf4, 0x1f });
+    const ok = responseFrame(&ok_buf, .live_status, 0, 0x00, &.{ 0x02, 0xf4, 0x1f });
 
     var fake: FakeFrames = .{ .frames = &.{ &keyboard, stale, ok } };
     const req = readReq();
-    const d = try exchange(&fake, &req, .live_status, monoMs() + 100);
+    const d = try exchange(&fake, &req, .live_status, .{ .offset = 0, .len = 3 }, monoMs() + 100);
     try std.testing.expectEqual(@as(u8, 3), d.len);
     try std.testing.expectEqual(@as(u8, 0x02), d.bytes()[0]);
 }
 
-test "事务：只有非响应帧（含截断响应）时报 Timeout，不把它们当结果" {
-    const notif = [_]u8{ 0x03, 0x03, 0x04 };
-    var buf: [protocol.frame_len]u8 = undefined;
-    const truncated = responseFrame(&buf, .live_status, 0x00, &.{ 0, 0, 0 })[0..40]; // 截断帧
+test "事务：同命令但 offset/长度不符的旧响应被丢弃，匹配帧随后被接受" {
+    var stale_buf: [protocol.frame_len]u8 = undefined;
+    var payload = std.mem.zeroes([3]u8);
+    @memset(&payload, 0x11);
+    const stale = responseFrame(&stale_buf, .live_status, 9, 0x00, &payload); // offset 不符
+    var ok_buf: [protocol.frame_len]u8 = undefined;
+    const ok = responseFrame(&ok_buf, .live_status, 0, 0x00, &.{ 0x03, 0x00, 0x00 });
 
-    var fake: FakeFrames = .{ .frames = &.{ &notif, truncated } };
+    var fake: FakeFrames = .{ .frames = &.{ stale, ok } };
     const req = readReq();
-    try std.testing.expectError(error.Timeout, exchange(&fake, &req, .live_status, monoMs() + 100));
+    const d = try exchange(&fake, &req, .live_status, .{ .offset = 0, .len = 3 }, monoMs() + 100);
+    try std.testing.expectEqual(@as(u8, 0x03), d.bytes()[0]);
+    try std.testing.expectEqual(@as(usize, 2), fake.read_count); // 旧帧被丢弃
+}
+
+test "事务：只有短通知时报 Timeout（设备没回），不当成坏帧" {
+    const notif = [_]u8{ 0x03, 0x03, 0x04 };
+    var fake: FakeFrames = .{ .frames = &.{&notif} };
+    const req = readReq();
+    try std.testing.expectError(error.Timeout, exchange(&fake, &req, .live_status, .{}, monoMs() + 100));
+}
+
+test "事务：只收到协议形状的坏帧（截断/异命令）时报 BadResponse，区分“设备没回”" {
+    var buf: [protocol.frame_len]u8 = undefined;
+    const truncated = responseFrame(&buf, .live_status, 0, 0x00, &.{ 0, 0, 0 })[0..40]; // report 4 截断
+    var fake: FakeFrames = .{ .frames = &.{truncated} };
+    const req = readReq();
+    try std.testing.expectError(error.BadResponse, exchange(&fake, &req, .live_status, .{}, monoMs() + 100));
+}
+
+test "事务：校验和损坏的帧以 BadChecksum 上报，不静默等到超时" {
+    var buf: [protocol.frame_len]u8 = undefined;
+    const f = responseFrame(&buf, .live_status, 0, 0x00, &.{ 1, 2, 3 });
+    buf[8] ^= 0xff; // 数据位被改，校验和失配
+    var fake: FakeFrames = .{ .frames = &.{f} };
+    const req = readReq();
+    try std.testing.expectError(error.BadChecksum, exchange(&fake, &req, .live_status, .{}, monoMs() + 100));
 }
 
 test "事务：设备用本次命令回话的忙/错误/未知状态为真实结论，不丢弃" {
     const req = readReq();
     var busy_buf: [protocol.frame_len]u8 = undefined;
-    var busy: FakeFrames = .{ .frames = &.{responseFrame(&busy_buf, .live_status, 0xfe, &.{0})} };
-    try std.testing.expectError(error.Busy, exchange(&busy, &req, .live_status, monoMs() + 100));
+    var busy: FakeFrames = .{ .frames = &.{responseFrame(&busy_buf, .live_status, 0, 0xfe, &.{0})} };
+    try std.testing.expectError(error.Busy, exchange(&busy, &req, .live_status, .{}, monoMs() + 100));
 
     var err_buf: [protocol.frame_len]u8 = undefined;
-    var device_error: FakeFrames = .{ .frames = &.{responseFrame(&err_buf, .live_status, 0xff, &.{0})} };
-    try std.testing.expectError(error.DeviceError, exchange(&device_error, &req, .live_status, monoMs() + 100));
+    var device_error: FakeFrames = .{ .frames = &.{responseFrame(&err_buf, .live_status, 0, 0xff, &.{0})} };
+    try std.testing.expectError(error.DeviceError, exchange(&device_error, &req, .live_status, .{}, monoMs() + 100));
 
     var odd_buf: [protocol.frame_len]u8 = undefined;
-    var odd: FakeFrames = .{ .frames = &.{responseFrame(&odd_buf, .live_status, 0x42, &.{0})} };
-    try std.testing.expectError(error.BadStatus, exchange(&odd, &req, .live_status, monoMs() + 100));
+    var odd: FakeFrames = .{ .frames = &.{responseFrame(&odd_buf, .live_status, 0, 0x42, &.{0})} };
+    try std.testing.expectError(error.BadStatus, exchange(&odd, &req, .live_status, .{}, monoMs() + 100));
+}
+
+test "事务：只见协议形状但都不匹配的帧，期限到了报 BadResponse" {
+    // 旧命令响应：形状是 report 4 的 64 字节帧，但命令回显不是本次请求
+    var stale_buf: [protocol.frame_len]u8 = undefined;
+    const stale = responseFrame(&stale_buf, .settings_read, 0, 0x00, &.{ 1, 2, 3 });
+    var fake: FakeFrames = .{ .frames = &.{ stale, stale } };
+    const req = readReq();
+    // “设备回了话但不是这次响应”与“设备根本没回”必须能区分开
+    try std.testing.expectError(error.BadResponse, exchange(&fake, &req, .live_status, .{}, monoMs() + 100));
+}
+
+test "事务：帧源的 I/O 错误原样透传，不被当成没回" {
+    const Failing = struct {
+        fn writeFrame(_: *@This(), _: []const u8) !void {}
+        // 显式 anyerror：exchange 里既有 Timeout 分支也有透传分支
+        fn nextFrame(_: *@This(), _: i32) anyerror![]const u8 {
+            return error.InputOutput;
+        }
+    };
+    var g: Failing = .{};
+    const req = readReq();
+    try std.testing.expectError(error.InputOutput, exchange(&g, &req, .live_status, .{}, monoMs() + 100));
 }
 
 test "事务：期限已过时不读帧直接报 Timeout" {
     var fake: FakeFrames = .{};
     const req = readReq();
-    try std.testing.expectError(error.Timeout, exchange(&fake, &req, .live_status, monoMs()));
+    try std.testing.expectError(error.Timeout, exchange(&fake, &req, .live_status, .{}, monoMs()));
     try std.testing.expectEqual(@as(usize, 1), fake.write_count); // 请求已发出，只是不再等
     try std.testing.expectEqual(@as(usize, 0), fake.read_count);
 }

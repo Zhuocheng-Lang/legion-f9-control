@@ -15,11 +15,46 @@ pub fn monoMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
 }
 
+/// 诊断日志的落点：生产为 null（直接写 stderr），测试可改写到 sink。
+/// 可替换才有两件事：`zig build test` 不再被“设备已连接”等日志刷屏；
+/// 以及能断言“日志里不出现设备地址/对象路径”（隐私约束不能只靠肉眼）。
+pub var log_sink: ?*const fn ([]const u8) void = null;
+
 /// 诊断日志统一走 stderr（stdout 只留结果）。f9d 与 ble 链路共用一份。
 pub fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
+    if (log_sink) |sink| {
+        sink(line);
+        return;
+    }
     std.fs.File.stderr().writeAll(line) catch {};
+}
+
+/// 替换日志落点，返回旧值供 defer 恢复。只给测试用。
+pub fn setLogSink(sink: ?*const fn ([]const u8) void) ?*const fn ([]const u8) void {
+    const old = log_sink;
+    log_sink = sink;
+    return old;
+}
+
+/// 丢弃日志的 sink（测试静音用）。
+pub fn discardLog(_: []const u8) void {}
+
+test "log：sink 可替换，内容与格式保持不变" {
+    const Capture = struct {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        fn sink(line: []const u8) void {
+            @memcpy(buf[0..line.len], line);
+            len = line.len;
+        }
+    };
+    const old = setLogSink(Capture.sink);
+    defer _ = setLogSink(old);
+
+    log("f9d: 设备已连接（{s}）", .{"usb"});
+    try std.testing.expectEqualStrings("f9d: 设备已连接（usb）\n", Capture.buf[0..Capture.len]);
 }
 
 pub const protocol = @import("protocol.zig");

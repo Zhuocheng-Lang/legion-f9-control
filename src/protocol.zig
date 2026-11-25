@@ -58,7 +58,24 @@ pub const Decoded = struct {
 };
 
 pub const EncodeError = error{PayloadTooLong};
-pub const DecodeError = error{ BadLength, BadReportId, CommandMismatch, Busy, DeviceError, BadStatus };
+pub const DecodeError = error{
+    BadLength,
+    BadReportId,
+    BadChecksum,
+    CommandMismatch,
+    LengthMismatch,
+    OffsetMismatch,
+    Busy,
+    DeviceError,
+    BadStatus,
+};
+
+/// 响应必须回显的请求字段。null 表示该字段不参与判定。
+/// 回显形状在真机上只对读命令有证据（见 spec §2），写/会话命令不强制。
+pub const Expect = struct {
+    offset: ?u16 = null,
+    len: ?u8 = null,
+};
 
 /// 读请求：数据区清零，长度字段 = 希望读回的字节数。
 pub fn encodeRead(buf: *[frame_len]u8, command: Command, offset: u16, len: u8) EncodeError!void {
@@ -78,23 +95,29 @@ pub fn encodeSession(buf: *[frame_len]u8, open: bool) EncodeError!void {
     return encodeWrite(buf, if (open) .session_open else .session_close, 0, &marker);
 }
 
-/// 解码响应帧。协议规定响应恒为 64 字节：不足 64 的截断帧一律 `BadLength`，
-/// 即使其声明的数据长度在帧内自洽也不接受；随后检查 report ID、命令回显与状态，
-/// 不解引用短包；校验和不参与判定（USB 链路层已有 CRC）。
-pub fn decodeResponse(raw: []const u8, expect: Command) DecodeError!Decoded {
+/// 解码响应帧。协议规定响应恒为 64 字节：不足 64 的截断帧一律 BadLength，
+/// 即使其声明的数据长度在帧内自洽也不接受；随后检查 report ID、校验和、命令回显、
+/// 声明长度、（按 want 要求的）offset/长度回显与状态，不解引用短包。
+/// 校验和覆盖 raw[3..64]（spec §2 confirmed）：不匹配说明帧已损坏或不是本协议帧，
+/// 必须以独立错误上报，不能当成“设备没回”。
+pub fn decodeResponse(raw: []const u8, expect: Command, want: Expect) DecodeError!Decoded {
     if (raw.len != frame_len) return error.BadLength;
     if (raw[0] != report_id) return error.BadReportId;
+    if (readChecksum(raw) != checksum(raw)) return error.BadChecksum;
     if (raw[3] != @intFromEnum(expect)) return error.CommandMismatch;
     const len = raw[4];
     if (len > max_payload) return error.BadLength;
+    const offset = @as(u16, raw[5]) | (@as(u16, raw[6]) << 8);
+    // 回显不符 = 这份帧不是本次请求的响应（残留旧响应/错位），由事务层丢弃重等
+    if (want.len) |l| if (len != l) return error.LengthMismatch;
+    if (want.offset) |o| if (offset != o) return error.OffsetMismatch;
     switch (raw[7]) {
         0x00 => {},
         0xfe => return error.Busy,
         0xff => return error.DeviceError,
         else => return error.BadStatus,
     }
-    var out: Decoded = .{ .offset = 0, .buf = undefined, .len = len };
-    out.offset = @as(u16, raw[5]) | (@as(u16, raw[6]) << 8);
+    var out: Decoded = .{ .offset = offset, .buf = undefined, .len = len };
     @memcpy(out.buf[0..len], raw[8..][0..len]);
     return out;
 }
@@ -123,26 +146,37 @@ fn encode(buf: *[frame_len]u8, command: Command, offset: u16, len: u8, payload: 
     buf[4] = len;
     std.mem.writeInt(u16, buf[5..7], offset, .little);
     @memcpy(buf[8..][0..payload.len], payload);
+    stampChecksum(buf);
+}
+
+/// 写入 [1:2] 的 16 位小端校验和。构造响应帧的最后一律调用它，
+/// 保证帧自校验（decodeResponse 会验校验和）。
+pub fn stampChecksum(buf: *[frame_len]u8) void {
     std.mem.writeInt(u16, buf[1..3], checksum(buf), .little);
 }
 
 /// 校验和覆盖校验字段之后的全部字节。
-fn checksum(buf: *const [frame_len]u8) u16 {
+fn checksum(buf: []const u8) u16 {
     var sum: u16 = 0;
-    for (buf[3..frame_len]) |b| sum +%= b;
+    for (buf[3..]) |b| sum +%= b;
     return sum;
 }
 
-/// 构造响应帧（测试用）。
+fn readChecksum(buf: []const u8) u16 {
+    return @as(u16, buf[1]) | (@as(u16, buf[2]) << 8);
+}
+
+/// 构造响应帧（测试用）：状态写完之后再盖校验和。
 fn buildResponse(buf: *[frame_len]u8, command: Command, offset: u16, status: u8, data: []const u8) void {
     encode(buf, command, offset, @intCast(data.len), data);
     buf[7] = status;
+    stampChecksum(buf);
 }
 
 test "USB 读请求向量（0x1a, offset 0, length 3）" {
     var buf: [frame_len]u8 = undefined;
     try encodeRead(&buf, .live_status, 0, 3);
-    var want = [_]u8{0} ** frame_len;
+    var want = std.mem.zeroes([frame_len]u8);
     want[0] = 0x04;
     want[1] = 0x1d; // 0x1a + 0x03，小端
     want[2] = 0x00;
@@ -162,7 +196,7 @@ test "状态解码向量（flag=0x02, rpm_raw=0x1ff4 → rpm=2045）" {
 test "响应解码：校验通过并拷出数据" {
     var buf: [frame_len]u8 = undefined;
     buildResponse(&buf, .live_status, 0x0102, 0x00, &.{ 1, 2, 3 });
-    const d = try decodeResponse(&buf, .live_status);
+    const d = try decodeResponse(&buf, .live_status, .{ .offset = 0x0102, .len = 3 });
     try std.testing.expectEqual(@as(u16, 0x0102), d.offset);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, d.bytes());
 }
@@ -171,33 +205,55 @@ test "响应解码：拒绝短包、report ID 5、回显不符与异常状态" {
     var buf: [frame_len]u8 = undefined;
     buildResponse(&buf, .live_status, 0, 0x00, &.{ 0, 0, 0 });
 
-    try std.testing.expectError(error.BadLength, decodeResponse(buf[0..7], .live_status));
-    try std.testing.expectError(error.BadLength, decodeResponse(buf[0..10], .live_status));
+    try std.testing.expectError(error.BadLength, decodeResponse(buf[0..7], .live_status, .{}));
+    try std.testing.expectError(error.BadLength, decodeResponse(buf[0..10], .live_status, .{}));
 
     // 截断帧：声明长度自洽也不接受（协议规定响应定长 64 字节）
-    try std.testing.expectError(error.BadLength, decodeResponse(buf[0..63], .live_status));
+    try std.testing.expectError(error.BadLength, decodeResponse(buf[0..63], .live_status, .{}));
 
     buf[4] = 200; // 长度字段越界
-    try std.testing.expectError(error.BadLength, decodeResponse(&buf, .live_status));
+    stampChecksum(&buf); // 校验和覆盖 [3..]，改动任何字段都要重盖，否则先报 BadChecksum
+    try std.testing.expectError(error.BadLength, decodeResponse(&buf, .live_status, .{}));
     buf[4] = 3;
+    stampChecksum(&buf);
 
     buf[0] = 0x05; // report ID 5 一律拒绝
-    try std.testing.expectError(error.BadReportId, decodeResponse(&buf, .live_status));
+    try std.testing.expectError(error.BadReportId, decodeResponse(&buf, .live_status, .{}));
     buf[0] = report_id;
 
-    try std.testing.expectError(error.CommandMismatch, decodeResponse(&buf, .settings_read));
+    try std.testing.expectError(error.CommandMismatch, decodeResponse(&buf, .settings_read, .{}));
 
     buf[7] = 0xfe;
-    try std.testing.expectError(error.Busy, decodeResponse(&buf, .live_status));
+    stampChecksum(&buf);
+    try std.testing.expectError(error.Busy, decodeResponse(&buf, .live_status, .{}));
     buf[7] = 0xff;
-    try std.testing.expectError(error.DeviceError, decodeResponse(&buf, .live_status));
+    stampChecksum(&buf);
+    try std.testing.expectError(error.DeviceError, decodeResponse(&buf, .live_status, .{}));
     buf[7] = 0x42;
-    try std.testing.expectError(error.BadStatus, decodeResponse(&buf, .live_status));
+    stampChecksum(&buf);
+    try std.testing.expectError(error.BadStatus, decodeResponse(&buf, .live_status, .{}));
+}
+
+test "响应解码：校验和与 offset/长度回显" {
+    var buf: [frame_len]u8 = undefined;
+    buildResponse(&buf, .live_status, 0, 0x00, &.{ 1, 2, 3 });
+
+    // 任意数据位被改：校验和失配必须独立报错（不能当成“没回”）
+    buf[8] ^= 0xff;
+    try std.testing.expectError(error.BadChecksum, decodeResponse(&buf, .live_status, .{}));
+    stampChecksum(&buf);
+
+    // 回显不符：说明不是本次请求的响应，事务层据此丢弃旧帧
+    try std.testing.expectError(error.LengthMismatch, decodeResponse(&buf, .live_status, .{ .len = 15 }));
+    try std.testing.expectError(error.OffsetMismatch, decodeResponse(&buf, .live_status, .{ .offset = 1 }));
+    // 未要求校验的字段不参与判定
+    const d = try decodeResponse(&buf, .live_status, .{ .offset = 0, .len = 3 });
+    try std.testing.expectEqual(@as(u8, 3), d.len);
 }
 
 test "挡位解码：byte[13] 取值 0-3，越界报错" {
     const gears = [_]Gear{ .quiet, .balanced, .beast, .turbo };
-    var block = [_]u8{0} ** settings_len;
+    var block = std.mem.zeroes([settings_len]u8);
     for (gears, 0..) |want, i| {
         block[gear_byte] = @intCast(i);
         try std.testing.expectEqual(want, try decodeGear(&block));
@@ -207,7 +263,7 @@ test "挡位解码：byte[13] 取值 0-3，越界报错" {
 }
 
 test "setGear 只改 byte[13]，其余不透明字节原样保留" {
-    var block = [_]u8{0xAA} ** settings_len;
+    var block: [settings_len]u8 = @splat(0xAA);
     setGear(&block, .turbo);
     try std.testing.expectEqual(@as(u8, 3), block[gear_byte]);
     for (0..settings_len) |i| {
@@ -227,14 +283,74 @@ test "会话帧：1 字节标记（0x01 开 / 0x02 提交）" {
     try std.testing.expectEqual(@as(u8, 0x02), buf[8]);
 }
 
+test "读请求：56 字节上限，57 字节报 PayloadTooLong" {
+    var buf: [frame_len]u8 = undefined;
+    try encodeRead(&buf, .settings_read, 0, max_payload);
+    try std.testing.expectEqual(max_payload, buf[4]);
+    try std.testing.expectError(error.PayloadTooLong, encodeRead(&buf, .settings_read, 0, max_payload + 1));
+}
+
+test "校验和：高位非零时按小端写入 [1:2]，覆盖 [3:64] 全部字节" {
+    // sum = 0x05(命令) + 0x38(长度 56) + 0xff + 0x02(偏移) = 0x13e
+    // → 低字节 0x3e、高字节 0x01。只测低位为 0 的向量（如 0x1a+0x03）会漏掉
+    // 字节序写反的缺陷。
+    var buf: [frame_len]u8 = undefined;
+    try encodeRead(&buf, .settings_read, 0x02ff, max_payload);
+    try std.testing.expectEqual(@as(u8, 0x3e), buf[1]);
+    try std.testing.expectEqual(@as(u8, 0x01), buf[2]);
+    try std.testing.expectEqual(@as(u16, 0x013e), readChecksum(&buf));
+    try std.testing.expectEqual(readChecksum(&buf), checksum(&buf));
+
+    // 偏移按小端写入 [5:7]
+    try std.testing.expectEqual(@as(u8, 0xff), buf[5]);
+    try std.testing.expectEqual(@as(u8, 0x02), buf[6]);
+}
+
+test "会话帧：完整 64 字节（report ID、长度、偏移、载荷与校验和都对）" {
+    var buf: [frame_len]u8 = undefined;
+    try encodeSession(&buf, true);
+    try std.testing.expectEqual(report_id, buf[0]);
+    try std.testing.expectEqual(@as(u8, 0x01), buf[4]); // length = 1
+    try std.testing.expectEqual(@as(u8, 0), buf[5]); // offset 低字节
+    try std.testing.expectEqual(@as(u8, 0), buf[6]); // offset 高字节
+    try std.testing.expectEqual(@as(u8, 0), buf[7]); // 请求方向保留 0
+    try std.testing.expectEqual(readChecksum(&buf), checksum(&buf));
+    for (buf[9..]) |b| try std.testing.expectEqual(@as(u8, 0), b); // 数据区其余补零
+}
+
+test "响应解码：超长包（>64）与未要求回显的字段" {
+    var buf: [frame_len]u8 = undefined;
+    buildResponse(&buf, .live_status, 7, 0x00, &.{ 9, 9, 9 });
+
+    var long: [frame_len + 1]u8 = undefined;
+    @memcpy(long[0..frame_len], &buf);
+    long[frame_len] = 0;
+    // 协议规定响应恒为 64 字节：多一个字节同样是长度异常，不能只判“不足”
+    try std.testing.expectError(error.BadLength, decodeResponse(&long, .live_status, .{}));
+
+    // 写/会话命令不据回显判错：want 为空时 offset/长度不同也接受
+    const d = try decodeResponse(&buf, .live_status, .{});
+    try std.testing.expectEqual(@as(u16, 7), d.offset);
+    try std.testing.expectEqualSlices(u8, &.{ 9, 9, 9 }, d.bytes());
+}
+
+test "状态解码：尾部未建模字节不参与解读，rpm 取高 6 位" {
+    const st = try decodeStatus(&.{ 0x02, 0xf4, 0x1f, 0xff, 0xff });
+    try std.testing.expectEqual(@as(u16, 2045), st.rpm);
+
+    // rpm_raw >> 2 的边界：低位被丢弃、全 1 不超过 u16
+    try std.testing.expectEqual(@as(u16, 0), (try decodeStatus(&.{ 0, 3, 0 })).rpm);
+    try std.testing.expectEqual(@as(u16, 16383), (try decodeStatus(&.{ 0, 0xff, 0xff })).rpm);
+}
+
 test "写请求帧：0x06 设置块 15 字节；载荷超长报错" {
-    const block = [_]u8{0xAB} ** settings_len;
+    const block: [settings_len]u8 = @splat(0xAB);
     var buf: [frame_len]u8 = undefined;
     try encodeWrite(&buf, .settings_write, 0, &block);
     try std.testing.expectEqual(@as(u8, 0x06), buf[3]);
     try std.testing.expectEqual(@as(u8, settings_len), buf[4]);
     try std.testing.expectEqualSlices(u8, &block, buf[8..][0..settings_len]);
 
-    const big = [_]u8{0} ** 57;
+    const big = std.mem.zeroes([57]u8);
     try std.testing.expectError(error.PayloadTooLong, encodeWrite(&buf, .settings_write, 0, &big));
 }

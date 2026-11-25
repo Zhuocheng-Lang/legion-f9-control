@@ -68,12 +68,18 @@ const MockDev = struct {
     seq: [8]Op = undefined,
     n: usize = 0,
     fail_at: ?Op = null,
+    /// 额外让 session_close 一律失败：验证“收尾 close 也失败时保留原始错误”。
+    fail_close: bool = false,
+    /// 让读响应只带这么多字节：覆盖设备实际回短了（ShortData）的分支。
+    read_short: ?u8 = null,
     read_block: [protocol.settings_len]u8 = [_]u8{0xA5} ** protocol.settings_len,
     status_data: [3]u8 = .{ 0x02, 0xf4, 0x1f },
     reads: [4]struct { command: protocol.Command, offset: u16, len: u8 } = undefined,
     n_reads: usize = 0,
     writes: usize = 0,
     written: ?[protocol.settings_len]u8 = null,
+    write_offset: ?u16 = null,
+    write_len: usize = 0,
 
     fn rec(self: *MockDev, op: Op) void {
         self.seq[self.n] = op;
@@ -97,13 +103,15 @@ const MockDev = struct {
             },
             else => return error.CommandMismatch,
         }
+        if (self.read_short) |n| resp.len = @min(resp.len, n);
         return resp;
     }
 
     pub fn write(self: *MockDev, command: protocol.Command, offset: u16, payload: []const u8) !void {
-        _ = offset;
         if (command != .settings_write) return error.CommandMismatch;
         self.rec(.write);
+        self.write_offset = offset;
+        self.write_len = payload.len;
         // 计数在失败判定之前：用于断言“失败后不重放写入”
         self.writes += 1;
         self.written = payload[0..protocol.settings_len].*;
@@ -114,6 +122,7 @@ const MockDev = struct {
         const op: Op = if (open) .session_open else .session_close;
         self.rec(op);
         if (self.fail_at == op) return error.Timeout;
+        if (self.fail_close and op == .session_close) return error.Timeout;
     }
 };
 
@@ -162,6 +171,55 @@ test "gearSet：close（提交）失败时不补发第二次 close，错误原�
         mock.seq[0..mock.n],
     );
     try std.testing.expectEqual(@as(usize, 1), mock.writes); // 已写入：close 失败不回滚也不重放
+}
+
+test "status/gearGet：设备回短（ShortData）与非法挡位值都原样上报" {
+    var short: MockDev = .{ .read_short = 2 }; // 实时状态至少要 3 字节
+    try std.testing.expectError(error.ShortData, status(&short));
+    // 请求照常要 3 字节，短的是设备实际回的数据：判错发生在 decodeStatus，不在事务层
+    try std.testing.expectEqual(@as(u8, 3), short.reads[0].len);
+
+    var short_block: MockDev = .{ .read_short = protocol.settings_len - 1 };
+    try std.testing.expectError(error.ShortData, gearGet(&short_block));
+
+    var bad_gear: MockDev = .{};
+    bad_gear.read_block[13] = 9; // 设备侧给了越界挡位
+    try std.testing.expectError(error.InvalidGear, gearGet(&bad_gear));
+}
+
+test "gearSet：读阶段失败（含 ShortData）补发一次 close，且不写设备" {
+    var mock: MockDev = .{ .fail_at = .read };
+    try std.testing.expectError(error.Timeout, gearSet(&mock, .turbo));
+    try std.testing.expectEqualSlices(Op, &.{ .session_open, .read, .session_close }, mock.seq[0..mock.n]);
+    try std.testing.expectEqual(@as(usize, 0), mock.writes);
+
+    var short: MockDev = .{ .read_short = protocol.settings_len - 1 };
+    try std.testing.expectError(error.ShortData, gearSet(&short, .turbo));
+    try std.testing.expectEqualSlices(Op, &.{ .session_open, .read, .session_close }, short.seq[0..short.n]);
+    try std.testing.expectEqual(@as(usize, 0), short.writes);
+}
+
+test "gearSet：收尾 close 也失败时保留原始错误，且只补一次 close" {
+    var mock: MockDev = .{ .fail_at = .write, .fail_close = true };
+    // 写入失败（请求可能已送达）+ 补发的 close 同样失败：错误仍是写入阶段的 Timeout，
+    // 且不因 close 失败再补发第二次（已失败的链路再等一个事务超时没有意义）。
+    try std.testing.expectError(error.Timeout, gearSet(&mock, .turbo));
+    try std.testing.expectEqualSlices(
+        Op,
+        &.{ .session_open, .read, .write, .session_close },
+        mock.seq[0..mock.n],
+    );
+    try std.testing.expectEqual(@as(usize, 1), mock.writes);
+}
+
+test "gearSet：写入 offset=0、长度=设置块长度（读-改-写不写坏相邻字节）" {
+    var mock: MockDev = .{};
+    try gearSet(&mock, .beast);
+    try std.testing.expectEqual(@as(?u16, 0), mock.write_offset);
+    try std.testing.expectEqual(@as(usize, protocol.settings_len), mock.write_len);
+    // 读设置块也是 offset 0、长度 15
+    try std.testing.expectEqual(@as(u16, 0), mock.reads[0].offset);
+    try std.testing.expectEqual(@as(u8, protocol.settings_len), mock.reads[0].len);
 }
 
 test "gearSet：完整序列 open → read → write → close，写入帧为读-改-写结果" {
