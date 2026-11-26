@@ -14,7 +14,7 @@ Zig 命令行第三方工具，可通过 USB 或蓝牙连接设备。
 
 ## 快速开始
 
-目前需要自行编译，暂无发行包。准备好 Linux、[mise](https://mise.jdx.dev/) 和 C 编译/链接工具链，并安装 libsystemd 开发文件（例如 `libsystemd-dev` 或 `systemd-devel`）。本项目通过 [`mise.toml`](mise.toml) 固定 Zig `0.15.1`，请勿改用系统 Zig。
+目前需要自行编译，暂无发行包。准备好 Linux、[mise](https://mise.jdx.dev/)、C 编译/链接工具链、`pkg-config` 与可链接的 libsystemd（`libsystemd-dev` 或 `systemd-devel` 提供 `libsystemd.so` 与 `libsystemd.pc`；sd-bus 声明由本项目自带，不需要 C 头文件）。本项目通过 [`mise.toml`](mise.toml) 固定 Zig `0.17.1`，请勿改用系统 Zig。
 
 在项目目录下构建：
 
@@ -89,6 +89,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 ## 已知限制
 
 USB 和蓝牙已在真机上验证状态读取、挡位读写、连续请求和断连恢复，但尚未覆盖全部环境。特别是 USB 权限/I/O 错误、真机截断响应、设备忙/错误状态、同时连接两台同类蓝牙设备，以及 BlueZ 未启动、蓝牙无通知或响应异常等场景，仍有待真机验收。请勿把当前版本当作稳定接口；详情见[验收记录与后续计划](docs/ROADMAP.md)。
+
+`f9d` 与 `f9ctl` 的路径校验与系统级 socket 判定使用 `statx`，需要 Linux 4.11 及以上（2017 年后发布的发行版都满足）。
 
 连接失败时，先确认 `f9d` 正在运行、设备已开启，且服务有访问设备的权限。错误信息写到终端的 stderr，按文案对照[故障排查文档](docs/troubleshooting.md)。
 

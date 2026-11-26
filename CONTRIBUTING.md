@@ -35,11 +35,10 @@ mise run check
 它等价于：
 
 ```sh
-mise exec -- zig fmt --check src/*.zig build.zig
-mise exec -- zig build test
+mise exec -- zig fmt --check src/*.zig build.zig build.zig.zon
+mise exec -- zig build test --test-timeout 120s
 mise exec -- zig build
 ./tools/check-sensitive.sh
-git diff --check
 ```
 
 `tools/check-sensitive.sh` 会检查被跟踪文件中的设备地址、抓包/私有材料、常见凭证与 `.env`；CI（`.github/workflows/ci.yml`）执行同样的检查，并额外验证 `zig build install --prefix` 的安装布局。

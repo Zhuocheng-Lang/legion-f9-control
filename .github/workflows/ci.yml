@@ -28,10 +28,10 @@ jobs:
         run: mise exec -- zig version
 
       - name: 格式检查
-        run: mise exec -- zig fmt --check src/*.zig build.zig
+        run: mise exec -- zig fmt --check src/*.zig build.zig build.zig.zon
 
       - name: 离线测试
-        run: mise exec -- zig build test
+        run: mise exec -- zig build test --test-timeout 120s
 
       - name: 构建
         run: mise exec -- zig build

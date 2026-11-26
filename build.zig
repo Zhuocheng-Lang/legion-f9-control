@@ -10,21 +10,21 @@ pub fn build(b: *std.Build) void {
 
     // 唯一的库模块。protocol / usb / ble / ops / ipc 都挂在它下面，
     // 两个可执行文件共用同一份实现。BLE 走系统 libsystemd 的 sd-bus C ABI，
-    // 因此整个库链接 libc/systemd；gc-sections 同时压掉未用代码
-    // （并避开 GCC 16 crt1.o 的 .sframe 重定位，旧 LLD 不支持它）。
+    // 因此整个库链接 libc/systemd；gc-sections 同时压掉未用代码。
     //
-    // 链接按库名 (-lsystemd) 交给链接器，不用 pkg-config 的 "systemd" 包：
-    // 本机 pkg-config 里同时存在名为 systemd 的空壳包（--libs 无输出），
-    // 选它会把 -lsystemd 弄丢。头文件/库目录改由 libsystemd.pc 显式补充，
-    // 这样 NixOS/Guix/自定义前缀或 sysroot 下也能找到（见 addSystemdPaths）。
+    // 链接交给 pkg-config 解析 libsystemd.pc：本机 pkg-config 里同时存在名为 systemd
+    // 的空壳包（--libs 无输出），选它会把 -lsystemd 弄丢。这同时给出库目录，
+    // NixOS/Guix/自定义前缀或 sysroot 下也能找到；pkg-config 或该 .pc 缺失时构建
+    // 明确失败，而不是退回一个不存在的库名。
+    // std.Io 时代不再需要 C 头文件（sd-bus 声明在 ble.zig 内以 extern 给出），
+    // 因此这里只关心链接参数；交叉编译时宿主 pkg-config 不可用，退回按库名链接。
     const f9 = b.addModule("f9", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    f9.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
-    addSystemdPaths(b, f9, target);
+    linkSystemd(f9, target);
 
     // 版本号注入可执行文件（stdout 只输出结果，--version 也走它）
     const version_options = b.addOptions();
@@ -59,7 +59,9 @@ pub fn build(b: *std.Build) void {
 
         const run = b.addRunArtifact(exe);
         run.step.dependOn(b.getInstallStep());
-        if (b.args) |args| run.addArgs(args);
+        // 透传参数在 make 阶段叠加，配置阶段看不到（Zig 0.17 起取代 b.args + addArgs：
+        // 改变运行参数不再触发 build.zig 重新编译）。
+        run.addPassthruArgs();
         b.step(app.run_step, app.description).dependOn(&run.step);
 
         // 入口文件里的测试也要跑（zig build test 只认显式列出的 root）。
@@ -75,34 +77,18 @@ pub fn build(b: *std.Build) void {
     installDataFiles(b);
 }
 
-/// 用 libsystemd.pc 补充头文件与库目录（仅本机编译；交叉编译时宿主 pkg-config 不可用）。
-/// 没有 pkg-config 或没有该 .pc 时静默回退到系统默认路径，保持原行为。
-fn addSystemdPaths(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    if (target.result.cpu.arch != builtin.cpu.arch) return;
-    if (target.result.os.tag != builtin.os.tag) return;
-
-    if (pkgConfig(b, "--cflags")) |cflags| addFlagPaths(mod, cflags, "-I", .include);
-    if (pkgConfig(b, "--libs")) |libs| addFlagPaths(mod, libs, "-L", .library);
-}
-
-fn pkgConfig(b: *std.Build, flag: []const u8) ?[]const u8 {
-    var code: u8 = 0;
-    const out = b.runAllowFail(&.{ "pkg-config", flag, "libsystemd" }, &code, .Ignore) catch return null;
-    if (code != 0) return null;
-    return out;
-}
-
-/// 从 pkg-config 输出里挑出 -I/-L 并加进模块；其他旗标（-D、-l）忽略。
-fn addFlagPaths(mod: *std.Build.Module, text: []const u8, comptime prefix: []const u8, comptime kind: enum { include, library }) void {
-    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    while (it.next()) |tok| {
-        if (!std.mem.startsWith(u8, tok, prefix)) continue;
-        const dir = tok[prefix.len..];
-        if (dir.len == 0) continue;
-        switch (kind) {
-            .include => mod.addIncludePath(.{ .cwd_relative = dir }),
-            .library => mod.addLibraryPath(.{ .cwd_relative = dir }),
-        }
+/// 链接系统 libsystemd。
+/// 同架构同 OS（本机编译）时让 pkg-config 解析 libsystemd.pc（给出 -lsystemd 与
+/// 库目录）；交叉编译时宿主 pkg-config 不可用，退回纯 -lsystemd。
+fn linkSystemd(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const native = target.result.cpu.arch == builtin.target.cpu.arch and
+        target.result.os.tag == builtin.target.os.tag;
+    if (native) {
+        // .force 而不是 .yes：.yes 在 pkg-config 缺席时按原名回退链接 -llibsystemd，
+        // 那是个不存在的库，报错反而更难懂；本机构建要求 pkg-config 可用。
+        mod.linkSystemLibrary("libsystemd", .{ .use_pkg_config = .force });
+    } else {
+        mod.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
     }
 }
 

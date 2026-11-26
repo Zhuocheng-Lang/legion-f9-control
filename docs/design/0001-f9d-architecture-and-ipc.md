@@ -115,9 +115,14 @@
 
 - `zig build install --prefix /usr` 安装程序、`f9ctl.1` 手册页、bash/zsh/fish 补全、
   systemd 单元与 udev 规则（见 README“安装”）。
-- 包构建时的 systemd 依赖定位：链接仍按 `-lsystemd`（避免本机 `systemd` 空壳 .pc 吞掉
-  `-lsystemd`），头文件/库目录由 `libsystemd.pc` 的 `-I`/`-L` 补充；没有 pkg-config
-  或交叉编译时回退系统默认路径。
+- 包构建时的 systemd 依赖定位：本机构建用 `linkSystemLibrary("libsystemd")` 并要求
+  pkg-config 解析 `libsystemd.pc`（避免本机 `systemd` 空壳 .pc 吞掉 `-lsystemd`）；
+  不用 `use_pkg_config = .yes`，它在 pkg-config 缺席时会按原名回退成链接不存在的
+  `-llibsystemd`，因此缺 pkg-config 或该 `.pc` 时构建明确失败。交叉编译改用纯
+  `-lsystemd`（宿主 pkg-config 与目标 sysroot 不匹配），该分支尚无构建验证。
+- Zig 0.17 移除 `@cImport` 后不再需要 C 头文件：sd-bus 的 28 个函数与 3 个不透明类型
+  在 `src/ble.zig` 里以 `extern` 直接声明（签名逐条对应 `systemd/sd-bus.h`），
+  构建阶段只做链接，不跑 translate-c，也不引入外部包。
 - CI（`.github/workflows/ci.yml`）执行格式检查、离线测试、构建、安装布局冒烟与
   `tools/check-sensitive.sh` 敏感信息检查；版本号在 `build.zig` 与 `build.zig.zon`
   同步维护，变更记录见 `CHANGELOG.md`。

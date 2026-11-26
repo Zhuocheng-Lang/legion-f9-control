@@ -1,8 +1,8 @@
 .{
     .name = .legion_f9_control,
-    .version = "0.1.0", // 与 build.zig 的 version 同步；首个 Zig 实现版本
+    .version = "0.1.0", // 与 build.zig 的 version 同步
     .fingerprint = 0x36c22d9dd3682c26,
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{
         "build.zig",

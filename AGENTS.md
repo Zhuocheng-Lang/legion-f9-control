@@ -19,10 +19,10 @@ Zig 实现的联想 Legion F9 控制工具：`f9ctl`（CLI）+ `f9d`（daemon）
 
 ## 目录与命令
 
-- `src/root.zig`：共享模块；`src/protocol.zig`：协议；`src/usb.zig` / `src/ble.zig`：链路；`src/ops.zig`：业务操作；`src/ipc.zig`：通信（含 `wire_errors`）；`src/main.zig` / `src/daemon.zig`：入口。
+- `src/root.zig`：共享模块（含 `std.posix.system` 底层原语：单调时钟、fd 读写、管道、睡眠）；`src/protocol.zig`：协议；`src/usb.zig` / `src/ble.zig`：链路；`src/ops.zig`：业务操作；`src/ipc.zig`：通信（含 `wire_errors`）；`src/main.zig` / `src/daemon.zig`：入口。
 - `docs/spec/`：协议事实与 v1 暴露范围；`docs/design/`：设计与验收；`docs/ROADMAP.md`：进展与未验收项；`docs/troubleshooting.md`：用户侧排查文案。
 - `packaging/`：systemd 单元、udev 规则、补全、手册页；`tools/check-sensitive.sh`：敏感信息检查；`CHANGELOG.md`：版本记录；`.github/workflows/ci.yml`：CI。
-- 工具版本固定于 `mise.toml`：`mise install`，随后使用 `mise exec -- zig build`、`mise exec -- zig build test`、`mise exec -- zig fmt --check src/*.zig build.zig`。`mise run check` 一次跑完全部离线检查。
+- 工具版本固定于 `mise.toml`：`mise install`，随后使用 `mise exec -- zig build`、`mise exec -- zig build test --test-timeout 120s`、`mise exec -- zig fmt --check src/*.zig build.zig build.zig.zon`。`mise run check` 一次跑完全部离线检查。
 - 本地运行：`mise exec -- zig build run -- status` 或 `mise exec -- zig build run-f9d`。不要用系统 Zig 版本代替 mise 固定版本。
 
 ## 验证与交付
