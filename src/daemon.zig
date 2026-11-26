@@ -18,6 +18,7 @@ const ops = f9.ops;
 const ipc = f9.ipc;
 const log = f9.log;
 const monoMs = f9.monoMs;
+const sleepMs = f9.sleepMs;
 
 /// 客户端连上后保持沉默的上限，防止单个连接长期占着处理线程。
 const conn_read_timeout_ms = 5000;
@@ -50,12 +51,17 @@ var wake_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
 fn initWakePipe() !void {
     if (wake_pipe[0] >= 0) return;
-    wake_pipe = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    var fds: [2]std.posix.fd_t = undefined;
+    switch (std.posix.errno(std.posix.system.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true }))) {
+        .SUCCESS => wake_pipe = fds,
+        else => return error.Unexpected,
+    }
 }
 
 fn wake() void {
     if (wake_pipe[1] < 0) return;
-    _ = std.posix.write(wake_pipe[1], "\x00") catch 0;
+    // write(2) 是 async-signal-safe：处理器里只做这一件事
+    _ = std.posix.system.write(wake_pipe[1], "\x00", 1);
 }
 
 /// 读空唤醒管道（非阻塞）：多个信号/多次唤醒合并成一次处理。
@@ -63,8 +69,9 @@ fn drainWake() void {
     if (wake_pipe[0] < 0) return;
     var buf: [16]u8 = undefined;
     while (true) {
-        const n = std.posix.read(wake_pipe[0], &buf) catch return;
-        if (n < buf.len) return;
+        const rc = std.posix.system.read(wake_pipe[0], &buf, buf.len);
+        if (std.posix.errno(rc) != .SUCCESS) return;
+        if (rc < buf.len) return;
     }
 }
 
@@ -118,9 +125,9 @@ const Link = union(enum) {
         };
     }
 
-    pub fn close(self: *Link) void {
+    pub fn close(self: *Link, io: std.Io) void {
         switch (self.*) {
-            .usb => |*d| d.close(),
+            .usb => |*d| d.close(io),
             .ble => |*d| d.close(),
         }
     }
@@ -128,8 +135,8 @@ const Link = union(enum) {
 
 /// 链路打开方式：函数指针注入，生产指向 usb/ble 模块，测试注入 fake。
 const Openers = struct {
-    usb_present: *const fn () bool,
-    usb_open: *const fn () anyerror!usb.Device,
+    usb_present: *const fn (std.Io) bool,
+    usb_open: *const fn (std.Io) anyerror!usb.Device,
     ble_open: *const fn () anyerror!ble.Device,
 
     const production: Openers = .{
@@ -139,12 +146,12 @@ const Openers = struct {
     };
 };
 
-fn presentUsb() bool {
-    return usb.Device.present();
+fn presentUsb(io: std.Io) bool {
+    return usb.Device.present(io);
 }
 
-fn openUsb() anyerror!usb.Device {
-    return usb.Device.open();
+fn openUsb(io: std.Io) anyerror!usb.Device {
+    return usb.Device.open(io);
 }
 
 fn openBle() anyerror!ble.Device {
@@ -160,8 +167,8 @@ fn tagOf(want: ipc.LinkKind) std.meta.Tag(Link) {
 
 /// USB 优先；仅当 USB 未找到/无应答时回落 BLE。
 /// 权限等其他 USB 错误原样上报：不能用 BLE 掩盖 USB 权限问题。
-fn openPreferred(openers: Openers) !Link {
-    const dev = openers.usb_open() catch |usb_err| {
+fn openPreferred(io: std.Io, openers: Openers) !Link {
+    const dev = openers.usb_open(io) catch |usb_err| {
         if (!shouldTryBle(usb_err)) return usb_err;
         const ble_dev = openers.ble_open() catch |ble_err| return combineLinkErrors(usb_err, ble_err);
         return .{ .ble = ble_dev };
@@ -204,13 +211,13 @@ fn shouldReplaceLink(tag: std.meta.Tag(Link), alive: bool, usb_present: bool, wa
 
 /// 尝试把现有句柄切到 USB：只有 USB 真正打开成功才切换。
 /// 失败（设备在但协议接口无应答/权限变化）时继续用现有链路，只记一行日志。
-fn trySwitchToUsb(st: *State, openers: Openers) bool {
-    const dev = openers.usb_open() catch |err| {
+fn trySwitchToUsb(io: std.Io, st: *State, openers: Openers) bool {
+    const dev = openers.usb_open(io) catch |err| {
         log("f9d: USB 已接入但不可用（{s}），继续使用现有链路", .{@errorName(err)});
         return false;
     };
     log("f9d: 检测到可用 USB，切回 USB 链路", .{});
-    st.drop();
+    st.drop(io);
     st.dev = .{ .usb = dev };
     return true;
 }
@@ -219,19 +226,19 @@ fn trySwitchToUsb(st: *State, openers: Openers) bool {
 const State = struct {
     dev: ?Link = null,
 
-    fn ensure(st: *State, openers: Openers, want: ?ipc.LinkKind) !*Link {
+    fn ensure(st: *State, io: std.Io, openers: Openers, want: ?ipc.LinkKind) !*Link {
         if (st.dev) |*cur| {
             const alive = cur.alive();
             // 只有 BLE 句柄才需要查“USB 是否已接入”，USB 句柄不必读 sysfs
-            const usb_present = cur.tag() == .ble and openers.usb_present();
+            const usb_present = cur.tag() == .ble and openers.usb_present(io);
             if (shouldReplaceLink(cur.tag(), alive, usb_present, want)) {
                 // USB 优先的切换只在现有链路仍可用、且 USB 真能打开时发生：
                 // 设备插着但协议接口无应答时继续用现有 BLE，不把可用链路推倒重来。
                 if (want == null and cur.tag() == .ble and alive and usb_present) {
-                    _ = trySwitchToUsb(st, openers);
+                    _ = trySwitchToUsb(io, st, openers);
                 } else {
                     log("f9d: 丢弃现有 {s} 链路，重新选择", .{@tagName(cur.tag())});
-                    st.drop();
+                    st.drop(io);
                 }
             }
         }
@@ -239,9 +246,9 @@ const State = struct {
             // 先在局部值里完成打开再写回：直接赋值给 st.dev 时，union 的 tag 会被先写入
             // 结果位置，payload 的 try 失败会留下“有 tag、无 payload”的半成品句柄。
             const opened: Link = if (want) |w| switch (w) {
-                .usb => .{ .usb = try openers.usb_open() },
+                .usb => .{ .usb = try openers.usb_open(io) },
                 .ble => .{ .ble = try openers.ble_open() },
-            } else try openPreferred(openers);
+            } else try openPreferred(io, openers);
             st.dev = opened;
             log("f9d: 设备已连接（{s}）", .{@tagName(st.dev.?.tag())});
             // 新链路：BLE 预算已从 open 入口起算（含打开），不再重置
@@ -253,8 +260,8 @@ const State = struct {
 
     /// 任何事务错误都丢弃句柄、由下个请求惰性重开来覆盖拔插/断线；
     /// 不做重试/退避，拔插频繁到日志噪声时可再加。
-    fn drop(st: *State) void {
-        if (st.dev) |*d| d.close();
+    fn drop(st: *State, io: std.Io) void {
+        if (st.dev) |*d| d.close(io);
         st.dev = null;
     }
 };
@@ -262,7 +269,7 @@ const State = struct {
 /// 终止信号标志：处理器只置位，主循环负责收尾。
 var signal_stop = std.atomic.Value(bool).init(false);
 
-fn onSignal(_: i32) callconv(.c) void {
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
     signal_stop.store(true, .release);
     wake(); // 先置标志再唤醒：主循环看到可读时状态已经就绪
 }
@@ -295,9 +302,10 @@ fn restoreDefaultSignalHandlers() void {
 
 /// 服务端共享状态：设备状态 + 串行化锁 + 连接计数 + 停止标志。
 const Server = struct {
+    io: std.Io,
     state: State = .{},
     openers: Openers = Openers.production,
-    dev_mutex: std.Thread.Mutex = .{},
+    dev_mutex: std.Io.Mutex = std.Io.Mutex.init,
     active: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     stop: *std.atomic.Value(bool) = &signal_stop,
     /// 没有自唤醒时的兜底轮询周期；测试可以放大它来证明“唤醒真的生效了”。
@@ -308,10 +316,10 @@ const Server = struct {
     }
 
     /// 循环：poll 等新连接 → 交给独立线程；读阶段与设备访问各自有界。
-    fn serve(self: *Server, srv: *std.net.Server) void {
+    fn serve(self: *Server, srv: *std.Io.net.Server) void {
         while (!self.stopping()) {
             var fds = [_]std.posix.pollfd{
-                .{ .fd = srv.stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = srv.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
                 .{ .fd = wake_pipe[0], .events = std.posix.POLL.IN, .revents = 0 },
             };
             const ready = std.posix.poll(&fds, self.accept_poll_ms) catch |err| {
@@ -328,20 +336,20 @@ const Server = struct {
                 return;
             }
             if (fds[0].revents & std.posix.POLL.IN == 0) continue;
-            const conn = srv.accept() catch |err| {
+            const conn = srv.accept(self.io) catch |err| {
                 log("f9d: accept 失败: {s}", .{@errorName(err)});
                 continue;
             };
-            self.spawnConn(conn.stream);
+            self.spawnConn(conn);
         }
     }
 
-    fn spawnConn(self: *Server, stream: std.net.Stream) void {
+    fn spawnConn(self: *Server, stream: std.Io.net.Stream) void {
         if (self.active.load(.acquire) >= max_connections) {
             // 立即拒绝：宁可用户看到 ServerBusy，也不让所有人在队列里饿死
-            respondError(stream, error.ServerBusy);
+            respondError(stream.socket.handle, error.ServerBusy);
             // 拒绝路径在 accept 线程上：只做短暂收尾，不能让一个赖着不关的对端卡住接入
-            finishConn(stream, reject_drain_ms);
+            finishConn(self.io, stream, reject_drain_ms);
             return;
         }
         _ = self.active.fetchAdd(1, .acq_rel);
@@ -349,7 +357,7 @@ const Server = struct {
         const th = std.Thread.spawn(.{}, handleConn, .{ stream, self }) catch |err| {
             _ = self.active.fetchSub(1, .acq_rel);
             log("f9d: 创建工作线程失败: {s}", .{@errorName(err)});
-            stream.close();
+            stream.close(self.io);
             return;
         };
         th.detach();
@@ -358,16 +366,17 @@ const Server = struct {
     fn dispatch(self: *Server, line: []const u8, buf: []u8) []const u8 {
         const req = ipc.parseRequest(line) catch |err| return ipc.formatError(buf, err);
         // 设备访问串行：会话命令有状态，多请求并发会互相破坏读-改-写
-        self.dev_mutex.lock();
-        defer self.dev_mutex.unlock();
+        // 用 lockUncancelable：这里没有取消源，且响应必须写完再返回
+        self.dev_mutex.lockUncancelable(self.io);
+        defer self.dev_mutex.unlock(self.io);
         return self.runRequest(req, buf) catch |err| return ipc.formatError(buf, err);
     }
 
     fn runRequest(self: *Server, req: ipc.Request, buf: []u8) ![]const u8 {
-        const dev = try self.state.ensure(self.openers, req.link);
+        const dev = try self.state.ensure(self.io, self.openers, req.link);
         // ensure 之后发生的任何错误都视为设备链路问题，丢弃句柄待下次重开
         return onDevice(dev, req.op, buf) catch |err| {
-            self.state.drop();
+            self.state.drop(self.io);
             return err;
         };
     }
@@ -387,40 +396,41 @@ fn onDevice(dev: *Link, op: ipc.Op, buf: []u8) ![]const u8 {
 }
 
 /// 一个连接：读一行 → 串行处理 → 写回一行，然后关闭。
-fn handleConn(stream: std.net.Stream, srv: *Server) void {
+fn handleConn(stream: std.Io.net.Stream, srv: *Server) void {
+    const fd = stream.socket.handle;
     defer {
-        finishConn(stream, conn_drain_ms);
+        finishConn(srv.io, stream, conn_drain_ms);
         _ = srv.active.fetchSub(1, .acq_rel);
     }
     var rbuf: [ipc.max_request_len]u8 = undefined;
-    const line = ipc.readLine(stream, &rbuf, conn_read_timeout_ms) catch |err| {
+    const line = ipc.readLine(fd, &rbuf, conn_read_timeout_ms) catch |err| {
         // 能回就回错误名，让客户端看到 TrailingData / LineTooLong 而不是“提前关闭”
-        respondError(stream, err);
+        respondError(fd, err);
         return;
     };
     var wbuf: [ipc.max_reply_len]u8 = undefined;
     const out = srv.dispatch(line, &wbuf);
-    stream.writeAll(out) catch return;
-    stream.writeAll("\n") catch {};
+    f9.writeAll(fd, out) catch return;
+    f9.writeAll(fd, "\n") catch {};
 }
 
-fn respondError(stream: std.net.Stream, err: anyerror) void {
+fn respondError(fd: std.posix.fd_t, err: anyerror) void {
     var buf: [ipc.max_reply_len]u8 = undefined;
     const out = ipc.formatError(&buf, err);
-    stream.writeAll(out) catch return;
-    stream.writeAll("\n") catch {};
+    f9.writeAll(fd, out) catch return;
+    f9.writeAll(fd, "\n") catch {};
 }
 
 /// 给已接受的连接设发送期限。响应只有几十到两百多字节，正常不会阻塞；
 /// 但对端若把接收窗口压到极小又不读，工作线程会卡在 writeAll 上直到进程退出。
 /// 设了期限后写失败返回 WouldBlock，连接随即关闭，线程不会泄漏。
-fn setSendTimeout(stream: std.net.Stream) void {
+fn setSendTimeout(stream: std.Io.net.Stream) void {
     const tv = std.posix.timeval{
         .sec = @intCast(@divTrunc(send_timeout_ms, 1000)),
         .usec = @intCast(@mod(send_timeout_ms, 1000) * 1000),
     };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.SNDTIMEO,
         std.mem.asBytes(&tv),
@@ -431,9 +441,9 @@ fn setSendTimeout(stream: std.net.Stream) void {
 /// 半关闭（shutdown write）让对端立刻看到 EOF，再按期限清空接收队列；
 /// 期限用尽就照常关闭——最坏情况退化成原来的一次性 close，不会无限挂住。
 /// 期限由调用方给：工作线程可以等满 `conn_drain_ms`，accept 线程只给 `reject_drain_ms`。
-fn finishConn(stream: std.net.Stream, drain_ms: i64) void {
-    const fd = stream.handle;
-    std.posix.shutdown(fd, .send) catch {};
+fn finishConn(io: std.Io, stream: std.Io.net.Stream, drain_ms: i64) void {
+    const fd = stream.socket.handle;
+    stream.shutdown(io, .send) catch {};
     const deadline = monoMs() + drain_ms;
     var scratch: [256]u8 = undefined;
     while (monoMs() < deadline) {
@@ -442,10 +452,10 @@ fn finishConn(stream: std.net.Stream, drain_ms: i64) void {
         if (left <= 0) break;
         const ready = std.posix.poll(&fds, left) catch break;
         if (ready == 0) continue;
-        const n = stream.read(&scratch) catch break;
+        const n = f9.readSome(fd, &scratch) catch break;
         if (n == 0) break; // 对端已关闭：接收队列已空，可以干净地 close
     }
-    stream.close();
+    stream.close(io);
 }
 
 /// 等在用连接收尾（有上限）。返回 true 表示已全部结束。
@@ -453,7 +463,7 @@ fn finishConn(stream: std.net.Stream, drain_ms: i64) void {
 fn waitIdle(srv: *Server, timeout_ms: i64) bool {
     const deadline = monoMs() + timeout_ms;
     while (srv.active.load(.acquire) != 0 and monoMs() < deadline) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        sleepMs(10);
     }
     if (srv.active.load(.acquire) != 0) {
         log("f9d: 仍有连接在处理，直接退出", .{});
@@ -462,16 +472,19 @@ fn waitIdle(srv: *Server, timeout_ms: i64) bool {
     return true;
 }
 
-pub fn main() void {
-    run() catch |err| {
+pub fn main(init: std.process.Init) void {
+    run(init) catch |err| {
         log("f9d: 启动失败: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
 }
 
-fn run() !void {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = ipc.daemonSocketPath(&path_buf) catch |err| switch (err) {
+fn run(init: std.process.Init) !void {
+    const io = init.io;
+    // 环境变量只在入口取一次（Zig 0.16 起不再是全局状态）
+    const xdg = init.minimal.environ.getPosix("XDG_RUNTIME_DIR");
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = ipc.daemonSocketPath(xdg, &path_buf) catch |err| switch (err) {
         error.NoRuntimeDir => {
             log("f9d: 未设置 XDG_RUNTIME_DIR，拒绝回退到 /tmp（可预测路径有符号链接攻击风险）", .{});
             std.process.exit(1);
@@ -481,58 +494,61 @@ fn run() !void {
             std.process.exit(1);
         },
     };
-    const is_root = std.posix.geteuid() == 0;
+    const is_root = std.posix.system.geteuid() == 0;
     // 非 root 实例的安全前提：XDG_RUNTIME_DIR 属主本人且权限不宽于 0700，
     // 否则 socket/lock 仍可被同机其他用户占位——不满足即拒绝启动。
-    if (!is_root) ipc.validateRuntimeDir() catch {
+    if (!is_root) ipc.validateRuntimeDir(xdg) catch {
         log("f9d: XDG_RUNTIME_DIR 须为属主本人、权限不宽于 0700 的目录，拒绝启动", .{});
         std.process.exit(1);
     };
-    if (is_root) std.fs.makeDirAbsolute(ipc.root_dir) catch |err| switch (err) {
+    if (is_root) std.Io.Dir.createDirAbsolute(io, ipc.root_dir, .fromMode(0o755)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => |e| return e,
     };
 
     // 防双开：对锁文件 flock，持锁期间残留 socket 必属死实例，直接清掉再绑定。
     // （原来的 connect 探测 → 删除 → bind 三步有 TOCTOU 窗口）
-    _ = try acquireLock(path);
-    std.fs.deleteFileAbsolute(path) catch {};
+    _ = try acquireLock(io, path);
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 
-    const addr = try std.net.Address.initUnix(path);
-    var srv_listen = try addr.listen(.{});
-    defer srv_listen.deinit();
+    var addr = try std.Io.net.UnixAddress.init(path);
+    var srv_listen = try addr.listen(io, .{});
+    defer srv_listen.deinit(io);
     // root 实例放开给任意本地用户（风扇控制，低敏）；要收紧就换用户组/polkit。
-    if (is_root) try std.posix.fchmodat(std.posix.AT.FDCWD, path, 0o666, 0);
+    // 失败必须上抛：权限没设成时非 root 客户端只会得到 EACCES，
+    // 静默继续会把“socket 有、连不上”推迟成难排查的运行期问题。
+    if (is_root) try std.Io.Dir.setFilePermissions(std.Io.Dir.cwd(), io, path, .fromMode(0o666), .{});
 
     // 自唤醒管道：信号处理器靠它打断 accept 前的 poll（未初始化时 wake 为空操作）
     try initWakePipe();
     installSignalHandlers();
     log("f9d: 监听 {s}", .{path});
 
-    var srv: Server = .{};
+    var srv: Server = .{ .io = io };
     srv.serve(&srv_listen);
 
     log("f9d: 收到终止信号，正在退出", .{});
     // 只有确认所有连接线程都结束后才释放设备状态：超时仍在处理时直接退出，
     // 由进程结束回收，避免在别的线程还持有 sd_bus/file 时关闭它。
-    if (waitIdle(&srv, shutdown_grace_ms)) srv.state.drop();
-    std.fs.deleteFileAbsolute(path) catch {};
+    if (waitIdle(&srv, shutdown_grace_ms)) srv.state.drop(io);
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 }
 
 /// 对 <socket>.lock 加排他非阻塞 flock；已有实例持锁则报 AlreadyRunning。
 /// 返回的 File 由调用方持有不关：锁随 fd 存活，进程退出自动释放。
-fn acquireLock(sock_path: []const u8) !std.fs.File {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+fn acquireLock(io: std.Io, sock_path: []const u8) !std.Io.File {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // XDG_RUNTIME_DIR 可超长：拼不进缓冲报错，不用 unreachable panic
     const lock_path = std.fmt.bufPrint(&buf, "{s}.lock", .{sock_path}) catch return error.PathTooLong;
     // truncate=false：即使锁文件路径被符号链接占位也不截断目标文件
     // （socket 目录本应可信，此为纵深防御）。
-    const f = try std.fs.createFileAbsolute(lock_path, .{ .truncate = false });
-    errdefer f.close();
-    std.posix.flock(f.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) catch |err| switch (err) {
-        error.WouldBlock => return error.AlreadyRunning,
-        else => |e| return e,
-    };
+    const f = try std.Io.Dir.createFileAbsolute(io, lock_path, .{ .truncate = false });
+    errdefer f.close(io);
+    switch (std.posix.errno(std.posix.system.flock(f.handle, std.posix.LOCK.EX | std.posix.LOCK.NB))) {
+        .SUCCESS => {},
+        .AGAIN => return error.AlreadyRunning, // EAGAIN == EWOULDBLOCK
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
     return f;
 }
 
@@ -544,19 +560,31 @@ test {
 // 测试：链路选择、复用策略、端到端 socket 服务
 // ---------------------------------------------------------------------------
 
+/// 用裸 fd 造一个阻塞模式的 Io.File（假设备与夹具的连接端用）。
+fn fdFile(fd: std.posix.fd_t) std.Io.File {
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+/// 连到夹具的 unix socket（等价于旧的 std.net.connectUnixSocket）。
+fn connectUnix(io: std.Io, path: []const u8) !std.Io.net.Stream {
+    var addr = try std.Io.net.UnixAddress.init(path);
+    return addr.connect(io);
+}
+
 test "acquireLock：同一路径不可重复加锁，释放后可再加" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_buf);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock = try std.fmt.bufPrint(&path_buf, "{s}/f9d.sock", .{dir});
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &dir_buf);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&path_buf, "{s}/f9d.sock", .{dir_buf[0..n]});
 
-    const first = try acquireLock(sock);
-    try std.testing.expectError(error.AlreadyRunning, acquireLock(sock));
-    first.close();
-    const second = try acquireLock(sock);
-    second.close();
+    const first = try acquireLock(io, sock);
+    try std.testing.expectError(error.AlreadyRunning, acquireLock(io, sock));
+    first.close(io);
+    const second = try acquireLock(io, sock);
+    second.close(io);
 }
 
 test "信号处理：SIGTERM 只置位停止标志，不终止进程" {
@@ -566,7 +594,7 @@ test "信号处理：SIGTERM 只置位停止标志，不终止进程" {
     defer restoreDefaultSignalHandlers();
 
     // 三个信号都必须装上同一个处理器（只测 TERM 会漏掉 INT/HUP 的接线）
-    inline for ([_]u8{ std.posix.SIG.INT, std.posix.SIG.TERM, std.posix.SIG.HUP }) |sig| {
+    inline for ([_]std.posix.SIG{ std.posix.SIG.INT, std.posix.SIG.TERM, std.posix.SIG.HUP }) |sig| {
         const act: std.posix.Sigaction = .{
             .handler = .{ .handler = onSignal },
             .mask = std.posix.sigemptyset(),
@@ -581,16 +609,16 @@ test "信号处理：SIGTERM 只置位停止标志，不终止进程" {
     signal_stop.store(false, .release);
     try std.posix.raise(std.posix.SIG.TERM);
     try std.testing.expect(signal_stop.load(.acquire));
-    var srv: Server = .{}; // 默认 stop 指向 signal_stop
+    var srv: Server = .{ .io = std.testing.io }; // 默认 stop 指向 signal_stop
     try std.testing.expect(srv.stopping());
     signal_stop.store(false, .release);
     try std.testing.expect(!srv.stopping());
 }
 
 test "acquireLock：锁路径过长报 PathTooLong，不触碰文件系统" {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     @memset(&path_buf, 'x'); // 满长 + ".lock" 必然放不下
-    try std.testing.expectError(error.PathTooLong, acquireLock(&path_buf));
+    try std.testing.expectError(error.PathTooLong, acquireLock(std.testing.io, &path_buf));
 }
 
 const LinkFakes = struct {
@@ -608,15 +636,15 @@ const LinkFakes = struct {
         ble_err = null;
     }
 
-    fn present() bool {
+    fn present(_: std.Io) bool {
         return usb_present;
     }
 
-    fn openFakeUsb() anyerror!usb.Device {
+    fn openFakeUsb(io: std.Io) anyerror!usb.Device {
         usb_calls += 1;
         if (usb_err) |err| return err;
         // /dev/null 充当假句柄：alive 为真，close 无副作用
-        return .{ .file = try std.fs.openFileAbsolute("/dev/null", .{}) };
+        return .{ .file = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{}) };
     }
 
     fn openFakeBle() anyerror!ble.Device {
@@ -655,6 +683,7 @@ test "serve：停止标志 + 自唤醒后立即退出，不再等 poll 周期" {
 }
 
 test "设备选择：仅 USB 未找到/无应答才回落 BLE，两条都不可用保留 USB 诊断" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     LinkFakes.reset();
@@ -662,25 +691,25 @@ test "设备选择：仅 USB 未找到/无应答才回落 BLE，两条都不可�
 
     // USB 未找到 + BLE 无 BlueZ：设备确实不在，报 DeviceNotFound
     LinkFakes.usb_err = error.DeviceNotFound;
-    try std.testing.expectError(error.DeviceNotFound, openPreferred(LinkFakes.openers));
+    try std.testing.expectError(error.DeviceNotFound, openPreferred(io, LinkFakes.openers));
     try std.testing.expectEqual(@as(usize, 1), LinkFakes.ble_calls);
 
     // USB 无应答 + BLE 无设备：保留“设备存在但协议接口无应答”
     LinkFakes.reset();
     LinkFakes.usb_err = error.DeviceNotResponding;
     LinkFakes.ble_err = error.DeviceNotFound;
-    try std.testing.expectError(error.DeviceNotResponding, openPreferred(LinkFakes.openers));
+    try std.testing.expectError(error.DeviceNotResponding, openPreferred(io, LinkFakes.openers));
 
     // USB 未找到 + BLE 权限被拒：BLE 的可诊断错误优先
     LinkFakes.reset();
     LinkFakes.usb_err = error.DeviceNotFound;
     LinkFakes.ble_err = error.BleAccessDenied;
-    try std.testing.expectError(error.BleAccessDenied, openPreferred(LinkFakes.openers));
+    try std.testing.expectError(error.BleAccessDenied, openPreferred(io, LinkFakes.openers));
 
     // USB 权限错误：原样上报，绝不回落 BLE
     LinkFakes.reset();
     LinkFakes.usb_err = error.UsbAccessDenied;
-    try std.testing.expectError(error.UsbAccessDenied, openPreferred(LinkFakes.openers));
+    try std.testing.expectError(error.UsbAccessDenied, openPreferred(io, LinkFakes.openers));
     try std.testing.expectEqual(@as(usize, 0), LinkFakes.ble_calls);
     try std.testing.expect(!shouldTryBle(error.UsbAccessDenied));
     try std.testing.expect(!shouldTryBle(error.Timeout));
@@ -701,101 +730,107 @@ test "复用策略：显式链路优先、挂断重开、BLE 遇到 USB 切回" 
 }
 
 test "State：复用期间不重复打开，丢弃后下个请求惰性重开" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     LinkFakes.reset();
     var st: State = .{};
-    const first = try st.ensure(LinkFakes.openers, null);
-    const again = try st.ensure(LinkFakes.openers, null);
+    const first = try st.ensure(io, LinkFakes.openers, null);
+    const again = try st.ensure(io, LinkFakes.openers, null);
     try std.testing.expect(first == again); // 同一句柄：不换链路、不重复打开
     try std.testing.expectEqual(@as(usize, 1), LinkFakes.usb_calls);
-    st.drop(); // 事务失败路径：丢弃句柄
+    st.drop(io); // 事务失败路径：丢弃句柄
     try std.testing.expect(st.dev == null);
-    _ = try st.ensure(LinkFakes.openers, null); // 下个请求惰性重开
+    _ = try st.ensure(io, LinkFakes.openers, null); // 下个请求惰性重开
     try std.testing.expectEqual(@as(usize, 2), LinkFakes.usb_calls);
     try std.testing.expectEqual(@as(usize, 0), LinkFakes.ble_calls); // USB 可用就不碰 BLE
-    st.drop();
+    st.drop(io);
 }
 
 test "State：双链路都不可用时 dev 保持空，错误原样上报" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     LinkFakes.reset();
     LinkFakes.usb_err = error.DeviceNotFound;
     LinkFakes.ble_err = error.BluezUnavailable;
     var st: State = .{};
-    try std.testing.expectError(error.DeviceNotFound, st.ensure(LinkFakes.openers, null));
+    try std.testing.expectError(error.DeviceNotFound, st.ensure(io, LinkFakes.openers, null));
     try std.testing.expect(st.dev == null);
     // 显式链路失败同样不留半成品句柄
-    try std.testing.expectError(error.BluezUnavailable, st.ensure(LinkFakes.openers, .ble));
+    try std.testing.expectError(error.BluezUnavailable, st.ensure(io, LinkFakes.openers, .ble));
     try std.testing.expect(st.dev == null);
-    st.drop();
+    st.drop(io);
 }
 
 test "trySwitchToUsb：只有新链路真能打开才替换，失败保留现有句柄" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     LinkFakes.reset();
     var st: State = .{};
-    _ = try st.ensure(LinkFakes.openers, .usb);
+    _ = try st.ensure(io, LinkFakes.openers, .usb);
     const before = st.dev.?.usb.file.handle;
 
     // 打不开（设备在但协议接口无应答）：保留原句柄，不推倒重来
     LinkFakes.usb_err = error.DeviceNotResponding;
-    try std.testing.expect(!trySwitchToUsb(&st, LinkFakes.openers));
+    try std.testing.expect(!trySwitchToUsb(io, &st, LinkFakes.openers));
     try std.testing.expectEqual(before, st.dev.?.usb.file.handle);
 
     // 能打开：替换句柄
     LinkFakes.usb_err = null;
-    try std.testing.expect(trySwitchToUsb(&st, LinkFakes.openers));
+    try std.testing.expect(trySwitchToUsb(io, &st, LinkFakes.openers));
     try std.testing.expect(st.dev.?.usb.file.handle != before);
-    st.drop();
+    st.drop(io);
 }
 
 test "State：挂断的句柄在复用前被替换，不先用死句柄失败一次" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     LinkFakes.reset();
     var st: State = .{};
 
     // 管道写端关闭 = 拔线：poll 报 POLLHUP，句柄仍可正常关闭（无 fd 复用陷阱）
-    const fds = try std.posix.pipe();
-    std.posix.close(fds[1]);
-    st.dev = .{ .usb = .{ .file = .{ .handle = fds[0] } } };
+    const fds = try f9.pipeFds();
+    f9.closeFd(fds[1]);
+    st.dev = .{ .usb = .{ .file = fdFile(fds[0]) } };
     try std.testing.expect(!st.dev.?.alive());
 
-    _ = try st.ensure(LinkFakes.openers, null); // 自动模式：死句柄不参与决策，直接重开
+    _ = try st.ensure(io, LinkFakes.openers, null); // 自动模式：死句柄不参与决策，直接重开
     try std.testing.expectEqual(std.meta.Tag(Link).usb, st.dev.?.tag());
     try std.testing.expect(st.dev.?.alive());
     try std.testing.expectEqual(@as(usize, 1), LinkFakes.usb_calls);
-    st.drop();
+    st.drop(io);
 }
 
 test "State：显式链路与现有句柄不符时换链，不回落另一条链路" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     LinkFakes.reset();
     var st: State = .{};
-    _ = try st.ensure(LinkFakes.openers, .usb);
+    _ = try st.ensure(io, LinkFakes.openers, .usb);
     try std.testing.expectEqual(std.meta.Tag(Link).usb, st.dev.?.tag());
 
     // 强制 BLE：先丢弃 USB 句柄再打开 BLE；打不开就报错，不偷偷用回 USB
     LinkFakes.ble_err = error.BluezUnavailable;
-    try std.testing.expectError(error.BluezUnavailable, st.ensure(LinkFakes.openers, .ble));
+    try std.testing.expectError(error.BluezUnavailable, st.ensure(io, LinkFakes.openers, .ble));
     try std.testing.expect(st.dev == null); // 旧句柄已丢弃，不留半成品
     try std.testing.expectEqual(@as(usize, 1), LinkFakes.ble_calls);
-    st.drop();
+    st.drop(io);
 }
 
 test "State：强制链路不走回落，错误原样上报" {
+    const io = std.testing.io;
     LinkFakes.reset();
     var st: State = .{};
     LinkFakes.ble_err = error.BluezUnavailable;
-    try std.testing.expectError(error.BluezUnavailable, st.ensure(LinkFakes.openers, .ble));
+    try std.testing.expectError(error.BluezUnavailable, st.ensure(io, LinkFakes.openers, .ble));
     try std.testing.expectEqual(@as(usize, 1), LinkFakes.ble_calls);
     try std.testing.expectEqual(@as(usize, 0), LinkFakes.usb_calls); // 不偷偷回落 USB
     try std.testing.expect(st.dev == null);
-    st.drop();
+    st.drop(io);
 }
 
 /// 假 hidraw：socketpair 的一端交给 usb.Device，另一端由设备线程回帧。
@@ -822,14 +857,16 @@ const FakeDevice = struct {
         settings[13] = 0x01; // balanced
     }
 
-    fn present() bool {
+    fn present(_: std.Io) bool {
         return true;
     }
 
-    fn openFakeUsb() anyerror!usb.Device {
+    fn openFakeUsb(_: std.Io) anyerror!usb.Device {
         const fd = client orelse return error.DeviceNotFound;
         _ = opens.fetchAdd(1, .acq_rel);
-        return .{ .file = .{ .handle = try std.posix.dup(fd) } };
+        const rc = std.posix.system.dup(fd);
+        if (std.posix.errno(rc) != .SUCCESS) return error.Unexpected;
+        return .{ .file = fdFile(@intCast(rc)) };
     }
 
     fn openFakeBle() anyerror!ble.Device {
@@ -839,19 +876,19 @@ const FakeDevice = struct {
     const openers: Openers = .{ .usb_present = present, .usb_open = openFakeUsb, .ble_open = openFakeBle };
 
     /// 设备侧线程：按请求命令回 64 字节响应帧，直到 stop 被置位或对端关闭。
-    fn serve(peer: std.fs.File) void {
+    fn serve(peer: std.posix.fd_t) void {
         var buf = std.mem.zeroes([protocol.frame_len]u8);
         while (!stop.load(.acquire)) {
-            var fds = [_]std.posix.pollfd{.{ .fd = peer.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            var fds = [_]std.posix.pollfd{.{ .fd = peer, .events = std.posix.POLL.IN, .revents = 0 }};
             if ((std.posix.poll(&fds, 100) catch return) == 0) continue;
-            const n = std.posix.read(peer.handle, &buf) catch return;
+            const n = f9.readSome(peer, &buf) catch return;
             if (n == 0) return;
             if (n != protocol.frame_len) continue;
             _ = requests.fetchAdd(1, .acq_rel);
             var resp = std.mem.zeroes([protocol.frame_len]u8);
             resp[0] = protocol.report_id;
             resp[3] = buf[3];
-            const cmd: protocol.Command = @enumFromInt(buf[3]);
+            const cmd: protocol.Command = @fromBackingInt(buf[3]);
             switch (cmd) {
                 .live_status => {
                     resp[4] = 3;
@@ -875,7 +912,7 @@ const FakeDevice = struct {
                 },
             }
             protocol.stampChecksum(&resp);
-            _ = std.posix.write(peer.handle, &resp) catch return;
+            f9.writeAll(peer, &resp) catch return;
         }
     }
 };
@@ -888,9 +925,9 @@ const FakeDevice = struct {
 const Harness = struct {
     tmp: std.testing.TmpDir = undefined,
     tmp_ready: bool = false,
-    sock_buf: [std.fs.max_path_bytes]u8 = undefined,
+    sock_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
     sock: []const u8 = "",
-    listener: ?std.net.Server = null,
+    listener: ?std.Io.net.Server = null,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 放大轮询周期以证明“停机靠自唤醒而不是靠 poll 超时”（见 serve 唤醒测试）。
     accept_poll_ms: i32 = default_accept_poll_ms,
@@ -898,29 +935,32 @@ const Harness = struct {
     srv_ready: bool = false,
     srv_thread: ?std.Thread = null,
     dev_thread: ?std.Thread = null,
-    peer: std.fs.File = undefined,
+    peer: std.posix.fd_t = -1,
     peer_open: bool = false,
     client_fd: std.posix.fd_t = -1,
 
     fn start(self: *Harness) !void {
+        const io = std.testing.io;
         // socket 放进测试临时目录：不再用固定的 /tmp 名字，也不会与并发测试撞名
         self.tmp = std.testing.tmpDir(.{});
         self.tmp_ready = true;
-        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir = try self.tmp.dir.realpath(".", &dir_buf);
-        self.sock = std.fmt.bufPrint(&self.sock_buf, "{s}/f9d.sock", .{dir}) catch return error.SkipZigTest;
+        var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try self.tmp.dir.realPath(io, &dir_buf);
+        self.sock = std.fmt.bufPrint(&self.sock_buf, "{s}/f9d.sock", .{dir_buf[0..n]}) catch return error.SkipZigTest;
         // unix socket 路径上限 107 字节（含结尾 0）：放不下就跳过，不截断
         if (self.sock.len >= 108) return error.SkipZigTest;
 
         var fds: [2]std.posix.fd_t = undefined;
         if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SkipZigTest;
         self.client_fd = fds[0];
-        self.peer = .{ .handle = fds[1] };
+        self.peer = fds[1];
         self.peer_open = true;
         FakeDevice.reset(fds[0]);
 
-        self.listener = try (try std.net.Address.initUnix(self.sock)).listen(.{});
+        var addr = std.Io.net.UnixAddress.init(self.sock) catch return error.SkipZigTest;
+        self.listener = try addr.listen(io, .{});
         self.srv = .{
+            .io = io,
             .openers = FakeDevice.openers,
             .stop = &self.stop,
             .accept_poll_ms = self.accept_poll_ms,
@@ -932,6 +972,7 @@ const Harness = struct {
     }
 
     fn deinit(self: *Harness) void {
+        const io = std.testing.io;
         initWakePipe() catch {}; // 唤醒管道不可用也不影响收尾（退化为轮询周期）
         self.stop.store(true, .release);
         wake();
@@ -939,19 +980,19 @@ const Harness = struct {
         self.srv_thread = null;
         // 设备句柄是 dup 出来的副本：先关夹具自己的连接端不会打断在用事务
         if (self.client_fd >= 0) {
-            std.posix.close(self.client_fd);
+            f9.closeFd(self.client_fd);
             self.client_fd = -1;
         }
-        if (self.srv_ready and waitIdle(&self.srv, 3000)) self.srv.state.drop();
+        if (self.srv_ready and waitIdle(&self.srv, 3000)) self.srv.state.drop(io);
         FakeDevice.stop.store(true, .release);
         if (self.dev_thread) |t| t.join();
         self.dev_thread = null;
         if (self.peer_open) {
-            self.peer.close();
+            f9.closeFd(self.peer);
             self.peer_open = false;
         }
         if (self.listener) |*l| {
-            l.deinit();
+            l.deinit(io);
             self.listener = null;
         }
         if (self.tmp_ready) {
@@ -963,7 +1004,7 @@ const Harness = struct {
 
 /// serve 的线程入口（方法不能直接当线程函数传）。
 const ServeThread = struct {
-    srv: *std.net.Server,
+    srv: *std.Io.net.Server,
     state: *Server,
     fn run(self: ServeThread) void {
         self.state.serve(self.srv);
@@ -971,6 +1012,7 @@ const ServeThread = struct {
 };
 
 test "端到端：socket → accept → dispatch → 设备事务（status/gear/gear set）" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     var h: Harness = .{};
@@ -978,17 +1020,17 @@ test "端到端：socket → accept → dispatch → 设备事务（status/gear/
     try h.start();
 
     const alloc = std.testing.allocator;
-    const st = try ipc.callOnPath(alloc, h.sock, .{ .op = .status });
+    const st = try ipc.callOnPath(io, alloc, h.sock, .{ .op = .status });
     defer st.deinit();
     try std.testing.expectEqual(@as(?u8, 0x02), st.value.flag);
     try std.testing.expectEqual(@as(?u16, 2045), st.value.rpm);
     try std.testing.expectEqual(@as(usize, 1), FakeDevice.requests.load(.acquire));
 
-    const gear = try ipc.callOnPath(alloc, h.sock, .{ .op = .gear_get });
+    const gear = try ipc.callOnPath(io, alloc, h.sock, .{ .op = .gear_get });
     defer gear.deinit();
     try std.testing.expectEqual(@as(?u8, 1), gear.value.gear);
 
-    const set = try ipc.callOnPath(alloc, h.sock, .{ .op = .{ .gear_set = .turbo } });
+    const set = try ipc.callOnPath(io, alloc, h.sock, .{ .op = .{ .gear_set = .turbo } });
     defer set.deinit();
     try std.testing.expectEqual(@as(?u8, 3), set.value.gear);
     // 精确帧数：status 1 + gear 1 + open/read/write/close/回读 5。少一帧说明
@@ -997,7 +1039,7 @@ test "端到端：socket → accept → dispatch → 设备事务（status/gear/
     try std.testing.expectEqual(@as(usize, 1), FakeDevice.opens.load(.acquire)); // 链路只打开一次
 
     // 强制 BLE：假 BLE 不可用，错误必须原样经 IPC 返回（不偷偷回落 USB）
-    const forced = try ipc.callOnPath(alloc, h.sock, .{ .op = .status, .link = .ble });
+    const forced = try ipc.callOnPath(io, alloc, h.sock, .{ .op = .status, .link = .ble });
     defer forced.deinit();
     try std.testing.expectEqualStrings("BluezUnavailable", forced.value.@"error".?);
     // 换链失败也不得用 USB 顶替：旧句柄已丢弃，没有发新帧
@@ -1005,6 +1047,7 @@ test "端到端：socket → accept → dispatch → 设备事务（status/gear/
 }
 
 test "端到端：gear 回读不一致报 GearMismatch，下一个请求重新打开设备" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     FakeDevice.ignore_writes.store(true, .release); // 设备“收下写入但不生效”
@@ -1015,43 +1058,44 @@ test "端到端：gear 回读不一致报 GearMismatch，下一个请求重新�
     try h.start();
 
     const alloc = std.testing.allocator;
-    const failed = try ipc.callOnPath(alloc, h.sock, .{ .op = .{ .gear_set = .turbo } });
+    const failed = try ipc.callOnPath(io, alloc, h.sock, .{ .op = .{ .gear_set = .turbo } });
     defer failed.deinit();
     try std.testing.expectEqualStrings("GearMismatch", failed.value.@"error".?);
     try std.testing.expectEqual(@as(?u8, null), failed.value.gear); // 不把旧挡位当成功回包
     try std.testing.expectEqual(@as(usize, 1), FakeDevice.opens.load(.acquire));
 
     // 事务失败即丢弃句柄：下一个请求重新建链，而不是在坏句柄上再失败一次
-    const again = try ipc.callOnPath(alloc, h.sock, .{ .op = .status });
+    const again = try ipc.callOnPath(io, alloc, h.sock, .{ .op = .status });
     defer again.deinit();
     try std.testing.expectEqual(@as(?u16, 2045), again.value.rpm);
     try std.testing.expectEqual(@as(usize, 2), FakeDevice.opens.load(.acquire));
 }
 
 test "端到端：连接数达到上限时立即回 ServerBusy，不排队等空闲连接" {
+    const io = std.testing.io;
     var h: Harness = .{};
     defer h.deinit();
     try h.start();
 
     // 占满上限：这些连接保持沉默（各占一个处理线程，不占设备锁）
-    var idle: [max_connections]std.net.Stream = undefined;
+    var idle: [max_connections]std.Io.net.Stream = undefined;
     var n: usize = 0;
     defer {
-        for (idle[0..n]) |s| s.close();
+        for (idle[0..n]) |s| s.close(io);
     }
     for (&idle) |*s| {
-        s.* = try std.net.connectUnixSocket(h.sock);
+        s.* = try connectUnix(io, h.sock);
         n += 1;
     }
     // accept 在服务线程里异步发生：等上限真的被占满再发下一个请求
     const deadline = monoMs() + 3000;
     while (h.srv.active.load(.acquire) < max_connections and monoMs() < deadline) {
-        std.Thread.sleep(2 * std.time.ns_per_ms);
+        sleepMs(2);
     }
     try std.testing.expectEqual(max_connections, h.srv.active.load(.acquire));
 
     const start_ms = monoMs();
-    const busy = try ipc.callOnPath(std.testing.allocator, h.sock, .{ .op = .status });
+    const busy = try ipc.callOnPath(io, std.testing.allocator, h.sock, .{ .op = .status });
     defer busy.deinit();
     try std.testing.expectEqualStrings("ServerBusy", busy.value.@"error".?);
     // 立即拒绝：远小于空闲连接的 5s 读超时，也没有排队
@@ -1060,6 +1104,7 @@ test "端到端：连接数达到上限时立即回 ServerBusy，不排队等空
 }
 
 test "端到端：尾随数据与超长请求行都被拒绝，空闲连接不阻塞其他客户端" {
+    const io = std.testing.io;
     const log_prev = silenceLog();
     defer _ = f9.setLogSink(log_prev);
     var h: Harness = .{};
@@ -1068,29 +1113,31 @@ test "端到端：尾随数据与超长请求行都被拒绝，空闲连接不�
 
     // 尾随数据：同一连接里换行后还有请求 → TrailingData，且不会被当成两个请求
     {
-        const stream = try std.net.connectUnixSocket(h.sock);
-        defer stream.close();
-        try stream.writeAll("status\ngear\n");
+        const stream = try connectUnix(io, h.sock);
+        defer stream.close(io);
+        const fd = stream.socket.handle;
+        try f9.writeAll(fd, "status\ngear\n");
         var buf: [ipc.max_reply_len]u8 = undefined;
-        const line = try ipc.readLine(stream, &buf, 2000);
+        const line = try ipc.readLine(fd, &buf, 2000);
         try std.testing.expectEqualStrings("{\"error\":\"TrailingData\"}", line);
     }
 
     // 超长请求行：写满请求缓冲区仍无换行 → LineTooLong（不是静默截断成一条命令）
     {
-        const stream = try std.net.connectUnixSocket(h.sock);
-        defer stream.close();
-        const long = [_]u8{'s'} ** (ipc.max_request_len + 8);
-        try stream.writeAll(&long);
+        const stream = try connectUnix(io, h.sock);
+        defer stream.close(io);
+        const fd = stream.socket.handle;
+        const long: [ipc.max_request_len + 8]u8 = @splat('s');
+        try f9.writeAll(fd, &long);
         var buf: [ipc.max_reply_len]u8 = undefined;
-        try std.testing.expectEqualStrings("{\"error\":\"LineTooLong\"}", try ipc.readLine(stream, &buf, 2000));
+        try std.testing.expectEqualStrings("{\"error\":\"LineTooLong\"}", try ipc.readLine(fd, &buf, 2000));
     }
 
     // 空闲连接占一个处理线程但不占设备锁：正常请求仍在短时间内完成
-    const idle = try std.net.connectUnixSocket(h.sock);
-    defer idle.close();
+    const idle = try connectUnix(io, h.sock);
+    defer idle.close(io);
     const start_ms = monoMs();
-    const reply = try ipc.callOnPath(std.testing.allocator, h.sock, .{ .op = .status });
+    const reply = try ipc.callOnPath(io, std.testing.allocator, h.sock, .{ .op = .status });
     defer reply.deinit();
     const elapsed = monoMs() - start_ms;
     try std.testing.expectEqual(@as(?u16, 2045), reply.value.rpm);
@@ -1099,9 +1146,10 @@ test "端到端：尾随数据与超长请求行都被拒绝，空闲连接不�
 }
 
 test "调度：非法请求不打开设备，直接回 BadRequest" {
+    const io = std.testing.io;
     LinkFakes.reset();
-    var srv: Server = .{ .openers = LinkFakes.openers };
-    defer srv.state.drop();
+    var srv: Server = .{ .io = io, .openers = LinkFakes.openers };
+    defer srv.state.drop(io);
 
     var buf: [ipc.max_reply_len]u8 = undefined;
     for ([_][]const u8{ "", "stats", "gear 4", "status  usb" }) |line| {

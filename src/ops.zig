@@ -72,7 +72,7 @@ const MockDev = struct {
     fail_close: bool = false,
     /// 让读响应只带这么多字节：覆盖设备实际回短了（ShortData）的分支。
     read_short: ?u8 = null,
-    read_block: [protocol.settings_len]u8 = [_]u8{0xA5} ** protocol.settings_len,
+    read_block: [protocol.settings_len]u8 = @splat(0xA5),
     status_data: [3]u8 = .{ 0x02, 0xf4, 0x1f },
     reads: [4]struct { command: protocol.Command, offset: u16, len: u8 } = undefined,
     n_reads: usize = 0,

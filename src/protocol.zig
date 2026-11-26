@@ -104,7 +104,7 @@ pub fn decodeResponse(raw: []const u8, expect: Command, want: Expect) DecodeErro
     if (raw.len != frame_len) return error.BadLength;
     if (raw[0] != report_id) return error.BadReportId;
     if (readChecksum(raw) != checksum(raw)) return error.BadChecksum;
-    if (raw[3] != @intFromEnum(expect)) return error.CommandMismatch;
+    if (raw[3] != @backingInt(expect)) return error.CommandMismatch;
     const len = raw[4];
     if (len > max_payload) return error.BadLength;
     const offset = @as(u16, raw[5]) | (@as(u16, raw[6]) << 8);
@@ -131,18 +131,18 @@ pub fn decodeStatus(data: []const u8) error{ShortData}!LiveStatus {
 
 /// 读设置块 byte[13] 得挡位。
 pub fn decodeGear(block: *const [settings_len]u8) error{InvalidGear}!Gear {
-    return std.meta.intToEnum(Gear, block[gear_byte]) catch error.InvalidGear;
+    return std.enums.fromInt(Gear, block[gear_byte]) orelse error.InvalidGear;
 }
 
 /// 只改 byte[13]，其余不透明字节原样保留（调用方负责读-改-写）。
 pub fn setGear(block: *[settings_len]u8, gear: Gear) void {
-    block[gear_byte] = @intFromEnum(gear);
+    block[gear_byte] = @backingInt(gear);
 }
 
 fn encode(buf: *[frame_len]u8, command: Command, offset: u16, len: u8, payload: []const u8) void {
     @memset(buf, 0);
     buf[0] = report_id;
-    buf[3] = @intFromEnum(command);
+    buf[3] = @backingInt(command);
     buf[4] = len;
     std.mem.writeInt(u16, buf[5..7], offset, .little);
     @memcpy(buf[8..][0..payload.len], payload);

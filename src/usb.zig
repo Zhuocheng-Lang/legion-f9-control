@@ -17,33 +17,39 @@ const response_timeout_ms = 2000;
 /// 同一设备会枚举出多个 hidraw 接口，只有协议接口会应答，探测超时取短。
 const probe_timeout_ms = 300;
 
+/// 用裸 fd 造一个阻塞模式的 `std.Io.File`（测试夹具与管道句柄用）。
+/// 生产路径一律经 `std.Io.Dir` 打开，flags 由 Io 实现填写。
+fn fileFromFd(fd: std.posix.fd_t) std.Io.File {
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
 pub const Device = struct {
-    file: std.fs.File,
+    file: std.Io.File,
 
     /// 找到 VID:PID 匹配且能应答协议探测的接口并打开（读写）。
-    pub fn open() !Device {
-        return openFrom("/sys/class/hidraw");
+    pub fn open(io: std.Io) !Device {
+        return openFrom(io, "/sys/class/hidraw");
     }
 
     /// 与 open 分离出来仅为可测：hidraw 子系统缺失/为空都归一化为 DeviceNotFound。
-    fn openFrom(sys_class_hidraw: []const u8) !Device {
-        var dir = std.fs.openDirAbsolute(sys_class_hidraw, .{ .iterate = true }) catch |err| switch (err) {
+    fn openFrom(io: std.Io, sys_class_hidraw: []const u8) !Device {
+        var dir = std.Io.Dir.openDirAbsolute(io, sys_class_hidraw, .{ .iterate = true }) catch |err| switch (err) {
             // 无 hidraw 子系统（未加载/容器）：与“没插设备”同等对待
             error.FileNotFound => return error.DeviceNotFound,
             else => |e| return e,
         };
-        defer dir.close();
+        defer dir.close(io);
 
         var matched = false;
         var denied = false;
         var env_err: ?anyerror = null;
         var it = dir.iterate();
-        while (try it.next()) |entry| {
-            if (!try isTarget(dir, entry.name)) continue;
+        while (try it.next(io)) |entry| {
+            if (!try isTarget(io, dir, entry.name)) continue;
             matched = true;
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const path = try std.fmt.bufPrint(&path_buf, "/dev/{s}", .{entry.name});
-            const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| switch (err) {
+            const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
                 // 权限问题优先报告，比“无应答”更可操作
                 error.AccessDenied => {
                     denied = true;
@@ -58,7 +64,7 @@ pub const Device = struct {
                 },
             };
             const dev = probe(file) catch |err| {
-                file.close();
+                file.close(io);
                 // 接口层面的“无应答 / 不是本协议”只说明这个接口不对，试下一个；
                 // 权限、I/O 等环境错误先记下（不中断枚举，免得错过后面的真接口），
                 // 没有可用接口时再原样上报——吞掉它们会让 f9d 误判为设备缺失而回落 BLE。
@@ -74,26 +80,26 @@ pub const Device = struct {
         return if (matched) error.DeviceNotResponding else error.DeviceNotFound;
     }
 
-    pub fn close(dev: *Device) void {
-        dev.file.close();
+    pub fn close(dev: *Device, io: std.Io) void {
+        dev.file.close(io);
     }
 
     /// 静态检查是否存在本项目的 hidraw 接口（读 sysfs，不打开、不发帧）。
     /// daemon 复用 BLE 链路时用它发现“后插入的 USB”，避免每请求做一次探测事务。
-    pub fn present() bool {
-        return presentAt("/sys/class/hidraw") catch false;
+    pub fn present(io: std.Io) bool {
+        return presentAt(io, "/sys/class/hidraw") catch false;
     }
 
-    fn presentAt(sys_class_hidraw: []const u8) !bool {
-        var dir = std.fs.openDirAbsolute(sys_class_hidraw, .{ .iterate = true }) catch |err| switch (err) {
+    fn presentAt(io: std.Io, sys_class_hidraw: []const u8) !bool {
+        var dir = std.Io.Dir.openDirAbsolute(io, sys_class_hidraw, .{ .iterate = true }) catch |err| switch (err) {
             // 无 hidraw 子系统 = 没有设备节点
             error.FileNotFound => return false,
             else => |e| return e,
         };
-        defer dir.close();
+        defer dir.close(io);
         var it = dir.iterate();
-        while (try it.next()) |entry| {
-            if (try isTarget(dir, entry.name)) return true;
+        while (try it.next(io)) |entry| {
+            if (try isTarget(io, dir, entry.name)) return true;
         }
         return false;
     }
@@ -142,7 +148,7 @@ pub const Device = struct {
 /// hidraw 帧源：一个事务内复用同一个缓冲区。等下一帧的期限语义归调用方
 /// （`exchange`），这里只负责 poll + 读；测试用 fake 提供同一调用形状。
 const HidFrames = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     buf: [protocol.frame_len]u8 = undefined,
 
     fn writeFrame(self: *HidFrames, req: *const [protocol.frame_len]u8) !void {
@@ -167,8 +173,8 @@ const HidFrames = struct {
 
 /// 拔线相关 errno 的分类。
 ///
-/// 不经 `std.fs.File.write/read`：它们对未建模的 errno 走 `unexpectedErrno`，会往
-/// stderr 打整段堆栈，并且只给 `error.Unexpected`（f9ctl 显示“未预期的系统错误”）。
+/// 不经 `std.Io.File` 的读写：它们对未建模的 errno 走统一错误路径，会丢掉
+/// “设备已抽出”这类可诊断结论，只留下笼统的 I/O 错误（f9ctl 显示“未预期的系统错误”）。
 /// 真机实测（2026-09-24）：拔线中途写 hidraw 返回 `EPROTO`；`ENODEV`/`ENXIO`/
 /// `ESHUTDOWN` 也是同一类“设备已不可用”。归为 `NoDevice` 才能给出可诊断文案，
 /// 也才能在探测阶段被跳过、进而允许回落 BLE（`DeviceNotFound`）。
@@ -183,14 +189,14 @@ fn errnoError(e: std.posix.E) anyerror {
         .BUSY => return error.DeviceBusy,
         .AGAIN => return error.WouldBlock,
         else => {
-            log("f9d: hidraw 读写失败: 未建模的 errno {d}", .{@intFromEnum(e)});
+            log("f9d: hidraw 读写失败: 未建模的 errno {d}", .{@backingInt(e)});
             return error.Unexpected;
         },
     }
 }
 
 /// raw 写满一帧（EINTR 重试）。hidraw 一次写就是一帧，正常不会短写。
-fn rawWriteAll(file: std.fs.File, bytes: []const u8) !void {
+fn rawWriteAll(file: std.Io.File, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
         const rc = std.posix.system.write(file.handle, bytes.ptr + off, bytes.len - off);
@@ -203,7 +209,7 @@ fn rawWriteAll(file: std.fs.File, bytes: []const u8) !void {
 }
 
 /// raw 读一次（EINTR 重试）；一帧一次读，不拼接。0 = EOF（设备已拔）。
-fn rawRead(file: std.fs.File, buf: []u8) !usize {
+fn rawRead(file: std.Io.File, buf: []u8) !usize {
     while (true) {
         const rc = std.posix.system.read(file.handle, buf.ptr, buf.len);
         switch (std.posix.errno(rc)) {
@@ -215,7 +221,7 @@ fn rawRead(file: std.fs.File, buf: []u8) !usize {
 }
 
 /// 探测接口是否说本协议：发一次 0x1a 读请求并等合法响应（无副作用）。
-fn probe(file: std.fs.File) !Device {
+fn probe(file: std.Io.File) !Device {
     var req: [protocol.frame_len]u8 = undefined;
     try protocol.encodeRead(&req, .live_status, 0, 3);
     var g = HidFrames{ .file = file };
@@ -270,13 +276,14 @@ fn probeSkippable(err: anyerror) bool {
 }
 
 /// uevent 的 HID_ID=<总线>:<VID>:<PID>（十六进制）匹配目标设备。
-fn isTarget(dir: std.fs.Dir, name: []const u8) !bool {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+fn isTarget(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const uevent_path = try std.fmt.bufPrint(&path_buf, "{s}/device/uevent", .{name});
-    const f = dir.openFile(uevent_path, .{}) catch return false;
-    defer f.close();
+    const f = dir.openFile(io, uevent_path, .{}) catch return false;
+    defer f.close(io);
     var content: [1024]u8 = undefined;
-    const n = try f.read(&content);
+    // 与 hidraw 帧读取同一条 raw 路径：sysfs 里的短读不应引入 std 的统一错误映射
+    const n = try rawRead(f, &content);
     return matchVidPid(content[0..n]);
 }
 
@@ -295,12 +302,13 @@ fn matchVidPid(uevent: []const u8) bool {
 }
 
 test "缺少 hidraw 子系统时归一化为 DeviceNotFound" {
-    try std.testing.expectError(error.DeviceNotFound, Device.openFrom("/nonexistent-path"));
+    const io = std.testing.io;
+    try std.testing.expectError(error.DeviceNotFound, Device.openFrom(io, "/nonexistent-path"));
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
-    try std.testing.expectError(error.DeviceNotFound, Device.openFrom(dir)); // 空目录无接口
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    try std.testing.expectError(error.DeviceNotFound, Device.openFrom(io, buf[0..n])); // 空目录无接口
 }
 
 test "匹配 uevent 中的 HID_ID" {
@@ -338,76 +346,85 @@ test "探测失败分类：仅无应答/设备已拔可跳过，设备报错与�
 /// 在 tmpdir 里造一个假 hidraw 条目；条目名决定设备节点路径（/dev/{name}）。
 /// 名字 null / full 分别映射到 /dev/null、/dev/full，用真实内核行为模拟
 /// “无应答（EOF）”与“写入 I/O 错误”，无需 root、也无需真机。
-fn makeFakeInterface(tmp: std.testing.TmpDir, name: []const u8) !void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try tmp.dir.makePath(try std.fmt.bufPrint(&buf, "{s}/device", .{name}));
-    const uevent = try tmp.dir.createFile(try std.fmt.bufPrint(&buf, "{s}/device/uevent", .{name}), .{});
-    defer uevent.close();
-    try uevent.writeAll("HID_ID=0003:000017EF:0000F00C\n");
+fn makeFakeInterface(io: std.Io, tmp: std.testing.TmpDir, name: []const u8) !void {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/device", .{name}));
+    const uevent = try tmp.dir.createFile(io, try std.fmt.bufPrint(&buf, "{s}/device/uevent", .{name}), .{});
+    defer uevent.close(io);
+    try uevent.writeStreamingAll(io, "HID_ID=0003:000017EF:0000F00C\n");
 }
 
 test "枚举：候选接口无应答（EOF）仍归为 DeviceNotResponding（回落 BLE 的合法触发）" {
-    std.fs.accessAbsolute("/dev/null", .{}) catch return error.SkipZigTest;
+    const io = std.testing.io;
+    std.Io.Dir.accessAbsolute(io, "/dev/null", .{}) catch return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try makeFakeInterface(tmp, "null");
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try std.testing.expectError(error.DeviceNotResponding, Device.openFrom(try tmp.dir.realpath(".", &buf)));
+    try makeFakeInterface(io, tmp, "null");
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    try std.testing.expectError(error.DeviceNotResponding, Device.openFrom(io, buf[0..n]));
 }
 
 test "枚举：probe 的 I/O 错误原样上报，不被“无应答接口”吞掉" {
     // /dev/full 写入必 ENOSPC（环境错误）；同时放一个无应答接口（/dev/null，读 EOF），
     // 无论扫描顺序如何都必须报出 I/O 错误。
     // 修复前：所有 probe 错误被丢弃 → DeviceNotResponding → f9d 错误回落 BLE。
-    std.fs.accessAbsolute("/dev/full", .{}) catch return error.SkipZigTest;
-    std.fs.accessAbsolute("/dev/null", .{}) catch return error.SkipZigTest;
+    const io = std.testing.io;
+    std.Io.Dir.accessAbsolute(io, "/dev/full", .{}) catch return error.SkipZigTest;
+    std.Io.Dir.accessAbsolute(io, "/dev/null", .{}) catch return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try makeFakeInterface(tmp, "null");
-    try makeFakeInterface(tmp, "full");
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try std.testing.expectError(error.NoSpaceLeft, Device.openFrom(try tmp.dir.realpath(".", &buf)));
+    try makeFakeInterface(io, tmp, "null");
+    try makeFakeInterface(io, tmp, "full");
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    try std.testing.expectError(error.NoSpaceLeft, Device.openFrom(io, buf[0..n]));
 }
 
 test "枚举：打开设备节点的非权限错误原样上报，不被“接口无应答”掩盖" {
     // /dev/shm 是目录：打开必然失败（EISDIR），模拟“节点在但打不开”的环境故障
-    std.fs.accessAbsolute("/dev/shm", .{}) catch return error.SkipZigTest;
+    const io = std.testing.io;
+    std.Io.Dir.accessAbsolute(io, "/dev/shm", .{}) catch return error.SkipZigTest;
     const log_prev = setLogSink(discardLog);
     defer _ = setLogSink(log_prev);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try makeFakeInterface(tmp, "shm");
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    try std.testing.expectError(error.IsDir, Device.openFrom(try tmp.dir.realpath(".", &buf)));
+    try makeFakeInterface(io, tmp, "shm");
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    try std.testing.expectError(error.IsDir, Device.openFrom(io, buf[0..n]));
 }
 
 test "present：只按 sysfs 判断接口在不在（不打开、不发帧）" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
-    try std.testing.expect(!try Device.presentAt(dir)); // 空目录
-    try makeFakeInterface(tmp, "null");
-    try std.testing.expect(try Device.presentAt(dir)); // 有 HID_ID 匹配的节点
-    try std.testing.expect(!try Device.presentAt("/nonexistent-hidraw"));
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const dir = buf[0..n];
+    try std.testing.expect(!try Device.presentAt(io, dir)); // 空目录
+    try makeFakeInterface(io, tmp, "null");
+    try std.testing.expect(try Device.presentAt(io, dir)); // 有 HID_ID 匹配的节点
+    try std.testing.expect(!try Device.presentAt(io, "/nonexistent-hidraw"));
 }
 
 test "alive：正常句柄可用，挂断（POLLHUP）与已关闭（POLLNVAL）报不可用" {
+    const io = std.testing.io;
     // 管道：关写端后读端得到 POLLHUP，正是拔线后 hidraw 报的挂断事件。
     // 只用“关掉 fd”测不到这条路径——那只会得到 POLLNVAL。
-    const fds = try std.posix.pipe();
-    const hung_up: Device = .{ .file = .{ .handle = fds[0] } };
-    defer hung_up.file.close();
+    const fds = try @import("root.zig").pipeFds();
+    const hung_up: Device = .{ .file = fileFromFd(fds[0]) };
+    defer hung_up.file.close(io);
     try std.testing.expect(hung_up.alive());
-    std.posix.close(fds[1]);
+    @import("root.zig").closeFd(fds[1]);
     try std.testing.expect(!hung_up.alive());
 
     // 已关闭的 fd：poll 报 POLLNVAL，同样视为“不可复用”
-    const f = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .read_write });
+    const f = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .read_write });
     const closed: Device = .{ .file = f };
     try std.testing.expect(closed.alive());
-    f.close();
+    f.close(io);
     try std.testing.expect(!closed.alive());
 }
 
@@ -434,9 +451,10 @@ test "errno 翻译：拔线相关错误码归为 NoDevice（可诊断、探测�
 }
 
 test "exchange：poll 可读但读到 0 字节（拔线 EOF）报 NoDevice" {
+    const io = std.testing.io;
     // /dev/null 写入即丢、读立即返回 EOF，语义等同“设备消失”
-    const f = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .read_write });
-    defer f.close();
+    const f = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .read_write });
+    defer f.close(io);
     var req: [protocol.frame_len]u8 = undefined;
     try protocol.encodeRead(&req, .live_status, 0, 3);
     var g = HidFrames{ .file = f };
@@ -469,7 +487,7 @@ const FakeFrames = struct {
 fn responseFrame(buf: *[protocol.frame_len]u8, command: protocol.Command, offset: u16, status: u8, data: []const u8) []const u8 {
     @memset(buf, 0);
     buf[0] = protocol.report_id;
-    buf[3] = @intFromEnum(command);
+    buf[3] = @backingInt(command);
     buf[4] = @intCast(data.len);
     std.mem.writeInt(u16, buf[5..7], offset, .little);
     buf[7] = status;

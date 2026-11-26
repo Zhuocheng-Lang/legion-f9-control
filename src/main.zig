@@ -138,16 +138,19 @@ fn parseGear(s: []const u8) error{InvalidGearValue}!protocol.Gear {
     if (std.mem.eql(u8, s, "beast")) return .beast;
     if (std.mem.eql(u8, s, "turbo")) return .turbo;
     if (std.fmt.parseInt(u8, s, 10)) |n| {
-        return std.meta.intToEnum(protocol.Gear, n) catch error.InvalidGearValue;
+        return std.enums.fromInt(protocol.Gear, n) orelse error.InvalidGearValue;
     } else |_| {}
     return error.InvalidGearValue;
 }
 
-pub fn main() void {
+pub fn main(init: std.process.Init) void {
+    // Zig 0.16 起环境变量不再是全局状态：只在入口取一次，再显式往下传。
+    const xdg = init.minimal.environ.getPosix("XDG_RUNTIME_DIR");
+
     var args_buf: [32][]const u8 = undefined;
     var n: usize = 0;
-    var it = std.process.args();
-    _ = it.next();
+    var it = init.minimal.args.iterate();
+    _ = it.next(); // 跳过程序名
     while (it.next()) |arg| {
         if (n == args_buf.len) usageFail(.{ .arg = arg }, error.TooManyArgs);
         args_buf[n] = arg;
@@ -158,7 +161,7 @@ pub fn main() void {
     const opts = parseArgs(args_buf[0..n], &diag) catch |err| usageFail(diag, err);
     switch (opts.op) {
         .help => {
-            std.fs.File.stdout().writeAll(usage) catch {};
+            f9.writeAll(std.posix.STDOUT_FILENO, usage) catch {};
             return;
         },
         .version => {
@@ -167,11 +170,12 @@ pub fn main() void {
         },
         else => {},
     }
-    execute(opts) catch |err| fail(err, opts.socket_path);
+    execute(init, xdg, opts) catch |err| fail(xdg, err, opts.socket_path);
 }
 
-fn execute(opts: Options) !void {
-    const alloc = std.heap.page_allocator;
+fn execute(init: std.process.Init, xdg: ?[]const u8, opts: Options) !void {
+    const io = init.io;
+    const alloc = init.gpa;
     const req: ipc.Request = .{
         .op = switch (opts.op) {
             .status => .status,
@@ -182,9 +186,9 @@ fn execute(opts: Options) !void {
         .link = opts.link,
     };
     const parsed = if (opts.socket_path) |path|
-        try ipc.callOnPath(alloc, path, req)
+        try ipc.callOnPath(io, alloc, path, req)
     else
-        try ipc.call(alloc, req);
+        try ipc.call(io, xdg, alloc, req);
     defer parsed.deinit();
     const reply = try unwrap(parsed.value);
 
@@ -197,13 +201,13 @@ fn execute(opts: Options) !void {
         }),
         .gear_get, .gear_set => blk: {
             const n = reply.gear orelse return error.BadReply;
-            const gear = std.meta.intToEnum(protocol.Gear, n) catch return error.BadReply;
+            const gear = std.enums.fromInt(protocol.Gear, n) orelse return error.BadReply;
             break :blk gearLine(&out, opts.json, gear);
         },
         .help, .version => unreachable,
     };
     // 结果写不出去（f9ctl status | head -n0）不是设备/通信故障：安静退出即可
-    std.fs.File.stdout().writeAll(line) catch |err| switch (err) {
+    f9.writeAll(std.posix.STDOUT_FILENO, line) catch |err| switch (err) {
         error.BrokenPipe => return,
         else => |e| return e,
     };
@@ -225,7 +229,7 @@ fn statusLine(buf: []u8, json: bool, v: StatusView) []const u8 {
 
 /// 挡位输出（含结尾换行）。
 fn gearLine(buf: []u8, json: bool, gear: protocol.Gear) []const u8 {
-    const n = @intFromEnum(gear);
+    const n = @backingInt(gear);
     if (json) {
         return std.fmt.bufPrint(buf, "{{\"gear\":{d},\"gear_name\":\"{s}\"}}\n", .{ n, @tagName(gear) }) catch unreachable;
     }
@@ -243,28 +247,29 @@ fn unwrap(reply: ipc.Reply) !ipc.Reply {
 
 /// 错误名是 IPC 线格式的一部分（ipc.wire_errors 与 daemon 侧 @errorName 一一对应）。
 fn errorFromName(name: []const u8) ?ipc.wire_errors {
-    inline for (@typeInfo(ipc.wire_errors).error_set.?) |e| {
-        if (std.mem.eql(u8, name, e.name)) return @field(ipc.wire_errors, e.name);
+    inline for (@typeInfo(ipc.wire_errors).error_set.error_names.?) |known| {
+        if (std.mem.eql(u8, name, known)) return @field(ipc.wire_errors, known);
     }
     return null;
 }
 
-/// 可信 stdout 输出（结果）。writeAll 失败只可能是管道关闭，忽略即可。
+/// 可信 stdout 输出（结果）。写失败只可能是管道关闭，忽略即可。
 fn print(comptime fmt: []const u8, args: anytype) !void {
     var buf: [512]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, fmt, args);
-    try std.fs.File.stdout().writeAll(line);
+    try f9.writeAll(std.posix.STDOUT_FILENO, line);
 }
 
 /// DaemonNotRunning 文案：按实际尝试过的 socket 路径拼，避免非 root 场景误导。
 /// 显式给了 `--socket` 就报那个路径：报默认路径会把排查引到不存在的实例上。
-fn daemonNotRunningMsg(buf: []u8, socket_path: ?[]const u8) []const u8 {
+fn daemonNotRunningMsg(xdg: ?[]const u8, buf: []u8, socket_path: ?[]const u8) []const u8 {
     if (socket_path) |path| return std.fmt.bufPrint(buf, "f9d 未运行（socket: {s}）", .{path}) catch "f9d 未运行";
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.fs.accessAbsolute(ipc.root_path, .{})) |_| {
+    var pbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    // 系统级 socket 是否存在的判定只影响文案措辞，用 statx 免去 Io 实例
+    if (ipc.rootSocketExists()) {
         return "f9d 未运行（socket: " ++ ipc.root_path ++ "）";
-    } else |_| {}
-    const upath = ipc.userSocketPath(&pbuf) catch |err| switch (err) {
+    }
+    const upath = ipc.userSocketPath(xdg, &pbuf) catch |err| switch (err) {
         error.NoRuntimeDir => return "f9d 未运行（且未设置 XDG_RUNTIME_DIR，用户级 f9d 拒绝回退 /tmp）",
         error.PathTooLong => return "XDG_RUNTIME_DIR 过长，拼不出 f9d socket 路径",
     };
@@ -284,25 +289,25 @@ fn usageFail(diag: Diag, err: anyerror) noreturn {
     } catch "参数错误";
     var out: [1024]u8 = undefined;
     const text = std.fmt.bufPrint(&out, "f9ctl: {s}\n\n{s}", .{ reason, usage }) catch usage;
-    std.fs.File.stderr().writeAll(text) catch {};
+    f9.writeAll(std.posix.STDERR_FILENO, text) catch {};
     std.process.exit(2);
 }
 
-fn fail(err: anyerror, socket_path: ?[]const u8) noreturn {
+fn fail(xdg: ?[]const u8, err: anyerror, socket_path: ?[]const u8) noreturn {
     var buf: [256]u8 = undefined;
-    const msg = messageFor(err, &buf, socket_path);
+    const msg = messageFor(xdg, err, &buf, socket_path);
     var out: [320]u8 = undefined;
     const line = std.fmt.bufPrint(&out, "f9ctl: {s}\n", .{msg}) catch "f9ctl: 出错\n";
-    std.fs.File.stderr().writeAll(line) catch {};
+    f9.writeAll(std.posix.STDERR_FILENO, line) catch {};
     std.process.exit(1);
 }
 
 /// 错误 → 用户文案。buf 供需要动态拼接的分支使用。
 /// 每个 ipc.wire_errors 成员都必须有专用文案（下方测试逐个检查），
 /// 否则用户只会看到“f9d 返回未知错误”/“出错: <name>”。
-fn messageFor(err: anyerror, buf: []u8, socket_path: ?[]const u8) []const u8 {
+fn messageFor(xdg: ?[]const u8, err: anyerror, buf: []u8, socket_path: ?[]const u8) []const u8 {
     return switch (err) {
-        error.DaemonNotRunning => daemonNotRunningMsg(buf, socket_path),
+        error.DaemonNotRunning => daemonNotRunningMsg(xdg, buf, socket_path),
         error.DaemonError => "f9d 返回未知错误（多为 f9ctl 与 f9d 版本不一致，细节见 f9d 日志）",
         error.BadReply => "f9d 响应格式异常",
         error.LineTooLong => "与 f9d 通信的报文超长",
@@ -436,46 +441,46 @@ test "输出格式：状态与挡位的 JSON / 人读文本" {
 
 test "错误名解析：daemon 线格式全部可往返，未知名返回 null" {
     // daemon 侧用 @errorName 作 IPC 线格式；这里保证每个名字都能映射回本地错误
-    inline for (@typeInfo(ipc.wire_errors).error_set.?) |e| {
-        const err = errorFromName(e.name) orelse return error.TestUnexpectedError;
-        try std.testing.expectEqualStrings(e.name, @errorName(err));
+    inline for (@typeInfo(ipc.wire_errors).error_set.error_names.?) |name| {
+        const err = errorFromName(name) orelse return error.TestUnexpectedError;
+        try std.testing.expectEqualStrings(name, @errorName(err));
     }
     try std.testing.expect(errorFromName("NoSuchError") == null);
 }
 
 test "daemon 线格式错误名都有专用文案，不走兜底" {
     var buf: [256]u8 = undefined;
-    inline for (@typeInfo(ipc.wire_errors).error_set.?) |e| {
-        const msg = messageFor(@field(ipc.wire_errors, e.name), &buf, null);
+    inline for (@typeInfo(ipc.wire_errors).error_set.error_names.?) |name| {
+        const msg = messageFor(null, @field(ipc.wire_errors, name), &buf, null);
         try std.testing.expect(!std.mem.startsWith(u8, msg, "出错: "));
     }
     // 关键措辞抽查：USB 与 BLE 的权限错误必须能区分
-    const usb_msg = messageFor(error.UsbAccessDenied, &buf, null);
-    try std.testing.expect(std.mem.indexOf(u8, usb_msg, "hidraw") != null);
-    const ble_msg = messageFor(error.BleAccessDenied, &buf, null);
-    try std.testing.expect(std.mem.indexOf(u8, ble_msg, "BlueZ") != null);
+    const usb_msg = messageFor(null, error.UsbAccessDenied, &buf, null);
+    try std.testing.expect(std.mem.find(u8, usb_msg, "hidraw") != null);
+    const ble_msg = messageFor(null, error.BleAccessDenied, &buf, null);
+    try std.testing.expect(std.mem.find(u8, ble_msg, "BlueZ") != null);
     // 超时语义必须能区分链路阶段
-    const t = messageFor(error.Timeout, &buf, null);
-    try std.testing.expect(std.mem.indexOf(u8, t, "连接") == null);
-    const ct = messageFor(error.ConnectTimeout, &buf, null);
-    try std.testing.expect(std.mem.indexOf(u8, ct, "连接") != null);
+    const t = messageFor(null, error.Timeout, &buf, null);
+    try std.testing.expect(std.mem.find(u8, t, "连接") == null);
+    const ct = messageFor(null, error.ConnectTimeout, &buf, null);
+    try std.testing.expect(std.mem.find(u8, ct, "连接") != null);
     // 连接上限：daemon 直接回包、不经过链路层，文案不能退化成“未知错误”
-    const busy = messageFor(error.ServerBusy, &buf, null);
-    try std.testing.expect(std.mem.indexOf(u8, busy, "连接数") != null);
+    const busy = messageFor(null, error.ServerBusy, &buf, null);
+    try std.testing.expect(std.mem.find(u8, busy, "连接数") != null);
     // 回显类错误两条链路都会产生：文案不能只写 BLE
     inline for ([_]anyerror{ error.LengthMismatch, error.OffsetMismatch }) |err| {
-        try std.testing.expect(std.mem.indexOf(u8, messageFor(err, &buf, null), "BLE") == null);
+        try std.testing.expect(std.mem.find(u8, messageFor(null, err, &buf, null), "BLE") == null);
     }
 }
 
 test "daemonNotRunningMsg：显式 --socket 时按用户给的路径拼文案" {
     var buf: [512]u8 = undefined;
-    const custom = daemonNotRunningMsg(&buf, "/tmp/isolated/f9d.sock");
+    const custom = daemonNotRunningMsg(null, &buf, "/tmp/isolated/f9d.sock");
     try std.testing.expectEqualStrings("f9d 未运行（socket: /tmp/isolated/f9d.sock）", custom);
 
     // 未给 --socket：仍按实际探测的默认路径（系统级或用户级）拼，且不出现用户路径
-    const def = daemonNotRunningMsg(&buf, null);
-    try std.testing.expect(std.mem.indexOf(u8, def, "/tmp/isolated") == null);
+    const def = daemonNotRunningMsg(null, &buf, null);
+    try std.testing.expect(std.mem.find(u8, def, "/tmp/isolated") == null);
     try std.testing.expect(std.mem.startsWith(u8, def, "f9d 未运行"));
 }
 

@@ -12,11 +12,24 @@
 //!   请求行之后不得再有字节：多余数据一律 `TrailingData` 拒绝，不做“读一行丢其余”。
 //! - 响应一行 JSON：成功 `{"flag":…,"rpm_raw":…,"rpm":…}` 或 `{"gear":…}`；
 //!   失败 `{"error":"<zig 错误名>"}`。错误名即线格式，展示文案归 f9ctl。
+//!
+//! 环境变量：Zig 0.16 起环境变量与命令行参数不再是全局状态，只从 `main` 的
+//! `std.process.Init` 取得。因此本模块不读 `getenv`，`XDG_RUNTIME_DIR` 由入口
+//! 传进来——副作用是路径规则变成纯函数，测试能确定性覆盖“未设置/空串/过长”。
+//!
+//! 读行与写行都直接作用在 fd 上（`std.posix.system.read/write`）：读端可能是 pipe
+//! 而不是 socket，且这里要的是“poll 期限 + 每次 read 的原始结论”，`Io.net.Stream`
+//! 的缓冲读会模糊这条边界。
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
 // 单调期限与 ble.zig 同源：墙钟回拨不放大 remaining，35s 慢滴上界始终成立
 const monoMs = @import("root.zig").monoMs;
+const pipeFds = @import("root.zig").pipeFds;
+const closeFd = @import("root.zig").closeFd;
+const sleepMs = @import("root.zig").sleepMs;
+const writeAll = @import("root.zig").writeAll;
+const readSome = @import("root.zig").readSome;
 
 pub const root_dir = "/run/f9d";
 pub const root_path = root_dir ++ "/f9d.sock";
@@ -114,18 +127,18 @@ pub fn parseRequest(line: []const u8) error{BadRequest}!Request {
         .status
     else if (std.mem.eql(u8, split.rest, "gear"))
         .gear_get
-    else if (std.mem.startsWith(u8, split.rest, "gear ")) blk: {
-        const n = std.fmt.parseInt(u8, split.rest["gear ".len..], 10) catch return error.BadRequest;
-        break :blk .{ .gear_set = std.meta.intToEnum(protocol.Gear, n) catch return error.BadRequest };
+    else if (std.mem.cutPrefix(u8, split.rest, "gear ")) |rest| blk: {
+        const n = std.fmt.parseInt(u8, rest, 10) catch return error.BadRequest;
+        break :blk .{ .gear_set = std.enums.fromInt(protocol.Gear, n) orelse return error.BadRequest };
     } else return error.BadRequest;
     return .{ .op = op, .link = split.link };
 }
 
 /// 拆出末尾的链路词（`usb`/`ble`）；不是链路词时整行都算命令。
 fn splitLink(line: []const u8) struct { rest: []const u8, link: ?LinkKind } {
-    const i = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return .{ .rest = line, .link = null };
-    const link = std.meta.stringToEnum(LinkKind, line[i + 1 ..]) orelse return .{ .rest = line, .link = null };
-    return .{ .rest = line[0..i], .link = link };
+    const head, const tail = std.mem.cutScalarLast(u8, line, ' ') orelse return .{ .rest = line, .link = null };
+    const link = std.meta.stringToEnum(LinkKind, tail) orelse return .{ .rest = line, .link = null };
+    return .{ .rest = head, .link = link };
 }
 
 /// 把请求写成一行（不含换行）。结果总在 buf 里（不返回栈上的临时缓冲）。
@@ -134,7 +147,7 @@ pub fn formatRequest(buf: []u8, req: Request) []const u8 {
     const body = switch (req.op) {
         .status => "status",
         .gear_get => "gear",
-        .gear_set => |g| std.fmt.bufPrint(&scratch, "gear {d}", .{@intFromEnum(g)}) catch unreachable,
+        .gear_set => |g| std.fmt.bufPrint(&scratch, "gear {d}", .{@backingInt(g)}) catch unreachable,
     };
     if (req.link) |l| return std.fmt.bufPrint(buf, "{s} {s}", .{ body, @tagName(l) }) catch unreachable;
     @memcpy(buf[0..body.len], body);
@@ -142,75 +155,111 @@ pub fn formatRequest(buf: []u8, req: Request) []const u8 {
 }
 
 /// daemon 侧 socket 路径：root → 系统级，否则用户级。
-pub fn daemonSocketPath(buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
-    if (std.posix.geteuid() == 0) return root_path;
-    return userSocketPath(buf);
+pub fn daemonSocketPath(xdg: ?[]const u8, buf: *[std.Io.Dir.max_path_bytes]u8) ![]const u8 {
+    if (std.posix.system.geteuid() == 0) return root_path;
+    return userSocketPath(xdg, buf);
 }
 
 /// XDG_RUNTIME_DIR 由登录会话创建（0700、属主本人），天然防 /tmp 占位；
 /// 未设置时报 NoRuntimeDir——可预测的 /tmp 路径会被符号链接攻击，拒绝回退。
 /// 拼接过长报 PathTooLong（该 env 由用户控制、可超长），不 panic。
 /// 该前提由 f9d 启动前的 validateRuntimeDir 实际校验，这里只负责拼路径。
-pub fn userSocketPath(buf: *[std.fs.max_path_bytes]u8) error{ NoRuntimeDir, PathTooLong }![]const u8 {
-    const dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse return error.NoRuntimeDir;
+pub fn userSocketPath(xdg: ?[]const u8, buf: *[std.Io.Dir.max_path_bytes]u8) error{ NoRuntimeDir, PathTooLong }![]const u8 {
+    const dir = xdg orelse return error.NoRuntimeDir;
     if (dir.len == 0) return error.NoRuntimeDir; // 空串视为未设置：拒绝回退 /tmp
     return socketPathIn(dir, buf);
 }
 
 /// 与读环境变量分离仅为可测：`<dir>/f9d.sock` 拼不进固定缓冲时报 PathTooLong。
-fn socketPathIn(dir: []const u8, buf: *[std.fs.max_path_bytes]u8) error{PathTooLong}![]const u8 {
+fn socketPathIn(dir: []const u8, buf: *[std.Io.Dir.max_path_bytes]u8) error{PathTooLong}![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/f9d.sock", .{dir}) catch return error.PathTooLong;
+}
+
+/// statx 的 `stx.mask` 说明内核实际填了哪些字段：老内核与部分文件系统可以
+/// 少填。缺任何请求字段就无从判定，调用方一律按不可信处理，
+/// 避免把全零结构读成“uid=0、mode=0”而误判。
+fn statxHas(mask: std.os.linux.STATX, comptime want: std.os.linux.STATX) bool {
+    return (!want.TYPE or mask.TYPE) and
+        (!want.MODE or mask.MODE) and
+        (!want.UID or mask.UID);
+}
+
+/// 系统级 socket 文件是否存在。只影响 DaemonNotRunning 的文案措辞，
+/// 因此不引入 Io 实例：statx 一次即可，取不到就按“不存在”处理。
+pub fn rootSocketExists() bool {
+    const path_z = std.posix.toPosixPath(root_path) catch return false;
+    var stx: std.os.linux.Statx = undefined;
+    const mask: std.os.linux.STATX = .{ .TYPE = true };
+    if (std.posix.errno(std.posix.system.statx(std.posix.AT.FDCWD, &path_z, 0, mask, &stx)) != .SUCCESS) return false;
+    // 内核/文件系统可以不填请求的字段（老内核、特殊 fs）：没填就当不存在，
+    // 不把全零 mode 读成“不是 socket”。
+    if (!statxHas(stx.mask, .{ .TYPE = true })) return false;
+    return stx.mode & std.posix.S.IFMT == std.posix.S.IFSOCK;
 }
 
 /// 非 root f9d 启动前的安全前提：XDG_RUNTIME_DIR 指向的目录必须属主本人、
 /// 权限不宽于 0700，否则 socket/lock 仍可被同机其他用户占位干扰。
-pub fn validateRuntimeDir() error{UntrustedRuntimeDir}!void {
-    const dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse return error.UntrustedRuntimeDir;
+pub fn validateRuntimeDir(xdg: ?[]const u8) error{UntrustedRuntimeDir}!void {
+    const dir = xdg orelse return error.UntrustedRuntimeDir;
     if (dir.len == 0) return error.UntrustedRuntimeDir;
     return checkTrustedDir(dir);
 }
 
-/// 与读环境变量分离出来仅为可测。fstatat 跟随符号链接：链到 /tmp 一样被拒。
+/// 与读环境变量分离出来仅为可测。statx 跟随符号链接：链到 /tmp 一样被拒。
+/// 用 statx 而不是 std.Io.Dir.statFile：需要 uid，而 Io 的 Stat 不建模它；
+/// 也不能用 fstatat——Zig 0.16 起因各 libc/target 的 struct stat 布局不一，
+/// 把 Linux 上的 stat 系列整体移除了，官方指引用 statx。
 fn checkTrustedDir(dir: []const u8) error{UntrustedRuntimeDir}!void {
-    const st = std.posix.fstatat(std.posix.AT.FDCWD, dir, 0) catch return error.UntrustedRuntimeDir;
-    if (st.mode & std.posix.S.IFMT != std.posix.S.IFDIR) return error.UntrustedRuntimeDir;
-    if (st.uid != std.posix.geteuid()) return error.UntrustedRuntimeDir;
-    if (st.mode & 0o077 != 0) return error.UntrustedRuntimeDir;
+    const path_z = std.posix.toPosixPath(dir) catch return error.UntrustedRuntimeDir;
+    var stx: std.os.linux.Statx = undefined;
+    const mask: std.os.linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+    // flags = 0：跟随符号链接（与旧的 fstatat(..., 0) 一致）
+    if (std.posix.errno(std.posix.system.statx(std.posix.AT.FDCWD, &path_z, 0, mask, &stx)) != .SUCCESS)
+        return error.UntrustedRuntimeDir;
+    // 缺任何一项都无法判定属主/权限位，一律按不可信拒绝。
+    if (!statxHas(stx.mask, .{ .TYPE = true, .MODE = true, .UID = true }))
+        return error.UntrustedRuntimeDir;
+    const mode: std.posix.mode_t = stx.mode;
+    if (mode & std.posix.S.IFMT != std.posix.S.IFDIR) return error.UntrustedRuntimeDir;
+    if (stx.uid != std.posix.system.geteuid()) return error.UntrustedRuntimeDir;
+    if (mode & 0o077 != 0) return error.UntrustedRuntimeDir;
 }
 
 /// 客户端连接 daemon：优先系统级 socket，其次当前用户的开发 socket。
-pub fn connect() !std.net.Stream {
-    if (std.fs.accessAbsolute(root_path, .{})) |_| {
+pub fn connect(io: std.Io, xdg: ?[]const u8) !std.Io.net.Stream {
+    // 与 f9ctl 的 DaemonNotRunning 文案共用同一判定：只有真正的 socket 文件才
+    // 算“系统级实例存在”，同名普通文件不再把连接引到必败的路径上。
+    if (rootSocketExists()) {
         // 系统级 socket 存在但拒绝连接（陈旧文件）时仍回退用户级
-        return connectUnix(root_path) catch |err| switch (err) {
-            error.DaemonNotRunning => connectUser(),
+        return connectUnix(io, root_path) catch |err| switch (err) {
+            error.DaemonNotRunning => connectUser(io, xdg),
             else => |e| return e,
         };
-    } else |_| {}
-    return connectUser();
+    }
+    return connectUser(io, xdg);
 }
 
-fn connectUser() !std.net.Stream {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+fn connectUser(io: std.Io, xdg: ?[]const u8) !std.Io.net.Stream {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // 无 XDG_RUNTIME_DIR 时 daemon 同样拒绝启动，直接报未运行
-    const path = userSocketPath(&buf) catch return error.DaemonNotRunning;
-    return connectUnix(path);
+    const path = userSocketPath(xdg, &buf) catch return error.DaemonNotRunning;
+    return connectUnix(io, path);
 }
 
-fn connectUnix(path: []const u8) !std.net.Stream {
-    return connectTo(path);
+fn connectUnix(io: std.Io, path: []const u8) !std.Io.net.Stream {
+    return connectTo(io, path);
 }
 
 /// 读到 '\n' 为止（返回不含换行）；超时、对端关闭、超长、尾随数据各自报错。
 /// timeout_ms 是进入函数起的绝对上限，防止逐字节慢滴无限续命。
 /// 期限基于单调时钟（root.monoMs）：墙钟调整不会改变剩余时间。
-pub fn readLine(stream: std.net.Stream, buf: []u8, timeout_ms: i32) ![]const u8 {
+pub fn readLine(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) ![]const u8 {
     const deadline = monoMs() + timeout_ms;
     var n: usize = 0;
     while (true) {
         if (n == buf.len) return error.LineTooLong;
         var fds = [_]std.posix.pollfd{.{
-            .fd = stream.handle,
+            .fd = fd,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
@@ -218,13 +267,13 @@ pub fn readLine(stream: std.net.Stream, buf: []u8, timeout_ms: i32) ![]const u8 
         if (remaining <= 0) return error.Timeout;
         if (try std.posix.poll(&fds, @intCast(@min(remaining, std.math.maxInt(i32)))) == 0)
             return error.Timeout;
-        const got = try stream.read(buf[n..]);
+        const got = try readSome(fd, buf[n..]);
         if (got == 0) return error.EndOfStream;
         // 旧数据里不可能有 '\n'（否则已返回），只搜新读入的段
-        if (std.mem.indexOfScalar(u8, buf[n..][0..got], '\n')) |i| {
+        if (std.mem.findScalar(u8, buf[n..][0..got], '\n')) |i| {
             // 换行后同一批里还有字节，或内核已排队后续字节：都不属于“一行一请求”
             if (i + 1 < got) return error.TrailingData;
-            if (try hasPending(stream)) return error.TrailingData;
+            if (try hasPending(fd)) return error.TrailingData;
             return buf[0 .. n + i];
         }
         n += got;
@@ -237,15 +286,15 @@ pub fn readLine(stream: std.net.Stream, buf: []u8, timeout_ms: i32) ![]const u8 
 /// 注意它只在“本次 read 恰好止于换行”时才被调用：缓冲区大于一行时，
 /// 尾随字节会和换行落在同一批里，走 readLine 里的同批判定。
 /// 有数据时消费掉这 1 字节不影响语义——调用方随后会以 TrailingData 拒绝整个请求。
-fn hasPending(stream: std.net.Stream) !bool {
+fn hasPending(fd: std.posix.fd_t) !bool {
     var fds = [_]std.posix.pollfd{.{
-        .fd = stream.handle,
+        .fd = fd,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
     if (try std.posix.poll(&fds, 0) == 0) return false;
     var byte: [1]u8 = undefined;
-    const n = stream.read(&byte) catch |err| switch (err) {
+    const n = readSome(fd, &byte) catch |err| switch (err) {
         error.WouldBlock => return false,
         // 对端 reset：我们已经拿到完整一行，且不可能再有“第二行请求”。
         // 把它当失败会让一条已经收到的响应变成“连接被重置”，
@@ -257,31 +306,35 @@ fn hasPending(stream: std.net.Stream) !bool {
 }
 
 /// 客户端调用：发请求行、等响应行、解析 JSON。返回的 Parsed 由调用方 deinit。
-pub fn call(alloc: std.mem.Allocator, req: Request) !std.json.Parsed(Reply) {
-    const stream = try connect();
-    return callOnStream(alloc, stream, req);
+pub fn call(io: std.Io, xdg: ?[]const u8, alloc: std.mem.Allocator, req: Request) !std.json.Parsed(Reply) {
+    const stream = try connect(io, xdg);
+    return callOnStream(io, alloc, stream, req);
 }
 
 /// 连到指定 socket 路径（f9ctl --socket / 测试用）。
-pub fn callOnPath(alloc: std.mem.Allocator, path: []const u8, req: Request) !std.json.Parsed(Reply) {
-    const stream = try connectTo(path);
-    return callOnStream(alloc, stream, req);
+pub fn callOnPath(io: std.Io, alloc: std.mem.Allocator, path: []const u8, req: Request) !std.json.Parsed(Reply) {
+    const stream = try connectTo(io, path);
+    return callOnStream(io, alloc, stream, req);
 }
 
-fn callOnStream(alloc: std.mem.Allocator, stream: std.net.Stream, req: Request) !std.json.Parsed(Reply) {
-    defer stream.close();
+fn callOnStream(io: std.Io, alloc: std.mem.Allocator, stream: std.Io.net.Stream, req: Request) !std.json.Parsed(Reply) {
+    const fd = stream.socket.handle;
+    defer stream.close(io);
     var wbuf: [max_request_len]u8 = undefined;
     const line = formatRequest(&wbuf, req);
-    try stream.writeAll(line);
-    try stream.writeAll("\n");
+    try writeAll(fd, line);
+    try writeAll(fd, "\n");
     var rbuf: [max_reply_len]u8 = undefined;
-    const rline = try readLine(stream, &rbuf, io_timeout_ms);
+    const rline = try readLine(fd, &rbuf, io_timeout_ms);
     return parseReply(alloc, rline);
 }
 
 /// 连接到指定路径：文件缺失/残留（拒绝连接）都视为 daemon 未运行。
-pub fn connectTo(path: []const u8) !std.net.Stream {
-    return std.net.connectUnixSocket(path) catch |err| switch (err) {
+pub fn connectTo(io: std.Io, path: []const u8) !std.Io.net.Stream {
+    var addr = std.Io.net.UnixAddress.init(path) catch |err| switch (err) {
+        error.NameTooLong => return error.NameTooLong, // 由 f9ctl 的文案映射成“socket 路径过长”
+    };
+    return addr.connect(io) catch |err| switch (err) {
         error.FileNotFound, error.ConnectionRefused => error.DaemonNotRunning,
         else => |e| return e,
     };
@@ -302,7 +355,7 @@ pub fn formatStatus(buf: []u8, st: protocol.LiveStatus) []const u8 {
 }
 
 pub fn formatGear(buf: []u8, gear: protocol.Gear) []const u8 {
-    return std.fmt.bufPrint(buf, "{{\"gear\":{d}}}", .{@intFromEnum(gear)}) catch unreachable;
+    return std.fmt.bufPrint(buf, "{{\"gear\":{d}}}", .{@backingInt(gear)}) catch unreachable;
 }
 
 /// zig 错误名是标识符（无引号/反斜杠），可安全嵌入 JSON 字符串。
@@ -336,29 +389,26 @@ test "请求解析/格式化：链路限定是末尾独立词，可与命令组�
     }
 }
 
-test "socket 路径按 euid 分支" {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.posix.geteuid() == 0) {
-        try std.testing.expectEqualStrings(root_path, try daemonSocketPath(&buf));
-    } else if (std.posix.getenv("XDG_RUNTIME_DIR")) |dir| {
-        if (dir.len > 0) {
-            var expect_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const expect = std.fmt.bufPrint(&expect_buf, "{s}/f9d.sock", .{dir}) catch unreachable;
-            return std.testing.expectEqualStrings(expect, try daemonSocketPath(&buf));
-        }
-        // 空字符串视为未设置：拒绝回退 /tmp
-        try std.testing.expectError(error.NoRuntimeDir, daemonSocketPath(&buf));
-        try std.testing.expectError(error.NoRuntimeDir, userSocketPath(&buf));
-    } else {
-        // 无 XDG_RUNTIME_DIR：拒绝回退 /tmp（可预测路径有符号链接攻击风险）
-        try std.testing.expectError(error.NoRuntimeDir, daemonSocketPath(&buf));
-        try std.testing.expectError(error.NoRuntimeDir, userSocketPath(&buf));
+test "socket 路径：root 用系统级，非 root 按传入的 XDG_RUNTIME_DIR 分支" {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.posix.system.geteuid() == 0) {
+        try std.testing.expectEqualStrings(root_path, try daemonSocketPath(null, &buf));
+        // root 实例忽略 XDG_RUNTIME_DIR：路径规则只由 euid 决定
+        try std.testing.expectEqualStrings(root_path, try daemonSocketPath("/run/user/0", &buf));
+        return;
     }
+    // 传入具体值时结果确定，不依赖测试进程的真实环境
+    try std.testing.expectEqualStrings("/run/user/1000/f9d.sock", try daemonSocketPath("/run/user/1000", &buf));
+    // 未设置与空串都视为“没有”：拒绝回退 /tmp（可预测路径有符号链接攻击风险）
+    try std.testing.expectError(error.NoRuntimeDir, daemonSocketPath(null, &buf));
+    try std.testing.expectError(error.NoRuntimeDir, daemonSocketPath("", &buf));
+    try std.testing.expectError(error.NoRuntimeDir, userSocketPath(null, &buf));
+    try std.testing.expectError(error.NoRuntimeDir, userSocketPath("", &buf));
 }
 
 test "socket 路径拼接过长报 PathTooLong（XDG_RUNTIME_DIR 可超长）" {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    var dir: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var dir: [std.Io.Dir.max_path_bytes]u8 = undefined;
     @memset(&dir, 'a'); // 满长目录名 + "/f9d.sock" 必然放不下
     try std.testing.expectError(error.PathTooLong, socketPathIn(&dir, &buf));
     try std.testing.expectEqualStrings("/run/f9d/f9d.sock", try socketPathIn("/run/f9d", &buf));
@@ -403,86 +453,87 @@ test "响应行是合法 JSON 且字段齐全" {
 
 test "readLine：分片、超时与关闭" {
     // pipe 与 socket 在 poll/read 语义上一致，足够覆盖 readLine 的读取路径
-    const fds = try std.posix.pipe();
-    const left: std.net.Stream = .{ .handle = fds[0] };
-    const right: std.fs.File = .{ .handle = fds[1] };
-    defer left.close();
+    const fds = try pipeFds();
+    const left = fds[0];
+    const right = fds[1];
+    defer closeFd(left);
 
-    try right.writeAll("sta");
-    try right.writeAll("tus\n");
+    try writeAll(right, "sta");
+    try writeAll(right, "tus\n");
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("status", try readLine(left, &buf, 1000));
 
     try std.testing.expectError(error.Timeout, readLine(left, &buf, 50));
 
-    right.close();
+    closeFd(right);
     try std.testing.expectError(error.EndOfStream, readLine(left, &buf, 1000));
 }
 
 test "readLine：同一次 read 里换行后还有字节 → TrailingData" {
-    const fds = try std.posix.pipe();
-    const left: std.net.Stream = .{ .handle = fds[0] };
-    const right: std.fs.File = .{ .handle = fds[1] };
-    defer left.close();
-    defer right.close();
+    const fds = try pipeFds();
+    const left = fds[0];
+    const right = fds[1];
+    defer closeFd(left);
+    defer closeFd(right);
 
     // 缓冲区远大于一行：两个请求会落在同一次 read 里，命中的是 readLine 内部的
     // 同批判定（另一条路径由下一个测试用恰好一行的缓冲区覆盖）。
     var buf: [32]u8 = undefined;
-    try right.writeAll("status\ngear\n");
+    try writeAll(right, "status\ngear\n");
     try std.testing.expectError(error.TrailingData, readLine(left, &buf, 1000));
     try std.testing.expectEqual(@as(i32, 0), try pollIdle(left)); // 未继续读走后续字节
 }
 
 test "readLine：换行处恰好读满缓冲区，排队字节经 hasPending 拒绝" {
-    const fds = try std.posix.pipe();
-    const left: std.net.Stream = .{ .handle = fds[0] };
-    const right: std.fs.File = .{ .handle = fds[1] };
-    defer left.close();
-    defer right.close();
+    const fds = try pipeFds();
+    const left = fds[0];
+    const right = fds[1];
+    defer closeFd(left);
+    defer closeFd(right);
 
     // 缓冲区恰好等于 "status\n"（7 字节）：本次 read 止于换行且没有同批字节，
     // 尾随数据的判定只能来自 hasPending 的“另有排队字节”分支。
-    try right.writeAll("status\n");
-    right.writeAll("gear\n") catch return error.SkipZigTest; // 管道满等极少见场景跳过
+    try writeAll(right, "status\n");
+    writeAll(right, "gear\n") catch return error.SkipZigTest; // 管道满等极少见场景跳过
     var buf: [7]u8 = undefined;
     try std.testing.expectError(error.TrailingData, readLine(left, &buf, 1000));
 }
 
 /// poll 一次：0 表示当前没有可读字节。
-fn pollIdle(stream: std.net.Stream) !i32 {
-    var fds = [_]std.posix.pollfd{.{ .fd = stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+fn pollIdle(fd: std.posix.fd_t) !i32 {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
     return @intCast(try std.posix.poll(&fds, 0));
 }
 
 test "readLine：对端写完一行即关闭不是尾随数据" {
-    const fds = try std.posix.pipe();
-    const left: std.net.Stream = .{ .handle = fds[0] };
-    const right: std.fs.File = .{ .handle = fds[1] };
-    defer left.close();
+    const fds = try pipeFds();
+    const left = fds[0];
+    const right = fds[1];
+    defer closeFd(left);
 
     var buf: [32]u8 = undefined;
-    try right.writeAll("status\n");
-    right.close(); // EOF：hasPending 读到 0 字节，不是“有多余字节”
+    try writeAll(right, "status\n");
+    closeFd(right); // EOF：hasPending 读到 0 字节，不是“有多余字节”
     try std.testing.expectEqualStrings("status", try readLine(left, &buf, 1000));
 }
 
 test "readLine：绝对超时，慢滴不能续命" {
-    const fds = try std.posix.pipe();
-    const left: std.net.Stream = .{ .handle = fds[0] };
-    const right: std.fs.File = .{ .handle = fds[1] };
-    defer left.close();
+    const fds = try pipeFds();
+    const left = fds[0];
+    const right = fds[1];
+    defer closeFd(left);
 
     // 每 20ms 滴一个字节；若每轮 poll 重新计时则永不超时（直至写满 LineTooLong）
-    const drip = std.Thread.spawn(.{}, struct {
-        fn run(f: std.fs.File) void {
-            defer f.close();
+    const Drip = struct {
+        fn run(fd: std.posix.fd_t) void {
+            defer closeFd(fd);
             for (0..64) |_| {
-                std.Thread.sleep(20 * std.time.ns_per_ms);
-                f.writeAll("x") catch return;
+                sleepMs(20);
+                writeAll(fd, "x") catch return;
             }
         }
-    }.run, .{right}) catch unreachable;
+    };
+    const drip = std.Thread.spawn(.{}, Drip.run, .{right}) catch unreachable;
     defer drip.join();
 
     const start = monoMs();
@@ -494,81 +545,104 @@ test "readLine：绝对超时，慢滴不能续命" {
     try std.testing.expect(elapsed >= 90 and elapsed < 3000);
 }
 
+/// 按路径 chmod（tmpDir 句柄是 O_PATH，句柄级 chmod 会 EBADF，只能走路径）。
+fn chmodPath(io: std.Io, path: []const u8, mode: std.posix.mode_t) !void {
+    try std.Io.Dir.setFilePermissions(std.Io.Dir.cwd(), io, path, .fromMode(mode), .{});
+}
+
+test "statxHas：内核漏填任何请求字段都算不可用" {
+    const all: std.os.linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+    try std.testing.expect(statxHas(all, all));
+    try std.testing.expect(statxHas(.{ .TYPE = true }, .{ .TYPE = true }));
+    // 全零 mask：内核什么都没填（老内核/特殊文件系统），绝不能当成可信
+    try std.testing.expect(!statxHas(.{}, all));
+    try std.testing.expect(!statxHas(.{}, .{ .TYPE = true }));
+    // 只缺一项也必须拒绝，否则 mode 或 uid 会以零值参与判定
+    try std.testing.expect(!statxHas(.{ .TYPE = true, .MODE = true }, all));
+    try std.testing.expect(!statxHas(.{ .TYPE = true, .UID = true }, all));
+    try std.testing.expect(!statxHas(.{ .MODE = true, .UID = true }, all));
+}
+
 test "checkTrustedDir：属主本人且权限不宽于 0700 才接受" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const dir = buf[0..n];
 
-    // tmpDir 句柄是 O_PATH，Dir.chmod 走 fchmod 会 EBADF，只能按路径 fchmodat
-    try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0);
+    try chmodPath(io, dir, 0o700);
     try checkTrustedDir(dir); // 属主本人 + 0700：接受
-    try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o755, 0);
+    try chmodPath(io, dir, 0o755);
     try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(dir)); // 他人可读：拒绝
 
-    try tmp.dir.writeFile(.{ .sub_path = "f", .data = "" });
-    const file = try tmp.dir.realpath("f", &buf);
-    try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(file)); // 非目录：拒绝
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "" });
+    const m = try tmp.dir.realPathFile(io, "f", &buf);
+    try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(buf[0..m])); // 非目录：拒绝
     try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir("/nonexistent-f9d-path"));
 }
 
 test "checkTrustedDir：任意 group/other 权限位都不接受" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &buf);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const dir = buf[0..n];
 
     // 0o077 掩码逐位覆盖：多一位就足以让同机其他用户占位 socket/lock
     for ([_]std.posix.mode_t{ 0o701, 0o710, 0o750, 0o770, 0o777 }) |mode| {
-        try std.posix.fchmodat(std.posix.AT.FDCWD, dir, mode, 0);
+        try chmodPath(io, dir, mode);
         try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(dir));
     }
     for ([_]std.posix.mode_t{ 0o700, 0o500 }) |mode| {
-        try std.posix.fchmodat(std.posix.AT.FDCWD, dir, mode, 0);
+        try chmodPath(io, dir, mode);
         try checkTrustedDir(dir);
     }
-    try std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0); // 还原，便于清理
+    try chmodPath(io, dir, 0o700); // 还原，便于清理
 }
 
 test "checkTrustedDir：符号链接按目标判定（指向宽权限目录即拒绝）" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try tmp.dir.realpath(".", &buf);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const target = try std.fmt.bufPrint(&path_buf, "{s}/open", .{root});
-    try std.posix.mkdir(target, 0o700);
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.Io.Dir.createDirAbsolute(io, target, .fromMode(0o700));
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const link = try std.fmt.bufPrint(&link_buf, "{s}/link", .{root});
-    try std.posix.symlink(target, link);
+    try std.Io.Dir.symLinkAbsolute(io, target, link, .{});
 
-    try std.posix.fchmodat(std.posix.AT.FDCWD, target, 0o700, 0);
+    try chmodPath(io, target, 0o700);
     try checkTrustedDir(link); // 链接本身 0777，但 fstatat 跟随目标：可信
-    try std.posix.fchmodat(std.posix.AT.FDCWD, target, 0o777, 0);
+    try chmodPath(io, target, 0o777);
     try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(link));
 
     // 悬空链接：无法判定目标，同样拒绝
-    var dangling_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dangling_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dangling = try std.fmt.bufPrint(&dangling_buf, "{s}/dangling", .{root});
-    try std.posix.symlink("/nonexistent-f9d-target", dangling);
+    try std.Io.Dir.symLinkAbsolute(io, "/nonexistent-f9d-target", dangling, .{});
     try std.testing.expectError(error.UntrustedRuntimeDir, checkTrustedDir(dangling));
 }
 
 test "readLine：缓冲区写满仍无换行报 LineTooLong（恰好容纳一行时不报）" {
-    const fds = try std.posix.pipe();
-    const left: std.net.Stream = .{ .handle = fds[0] };
-    const right: std.fs.File = .{ .handle = fds[1] };
-    defer left.close();
-    defer right.close();
+    const fds = try pipeFds();
+    const left = fds[0];
+    const right = fds[1];
+    defer closeFd(left);
+    defer closeFd(right);
 
     // 恰好容纳 "status\n"：不越界、正常返回
-    try right.writeAll("status\n");
+    try writeAll(right, "status\n");
     var exact: [7]u8 = undefined;
     try std.testing.expectEqualStrings("status", try readLine(left, &exact, 1000));
 
     // 等长但没有换行：缓冲区被写满即报错，而不是继续等下一批字节
-    try right.writeAll("statusx");
+    try writeAll(right, "statusx");
     var narrow: [7]u8 = undefined;
     try std.testing.expectError(error.LineTooLong, readLine(left, &narrow, 1000));
 }
@@ -581,19 +655,21 @@ fn unixSocketPathForTest(dir: []const u8, buf: []u8) ![]const u8 {
 }
 
 test "connectTo：文件不存在与陈旧 socket 都归一为 DaemonNotRunning" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_buf);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try unixSocketPathForTest(dir, &path_buf);
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &dir_buf);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try unixSocketPathForTest(dir_buf[0..n], &path_buf);
 
-    try std.testing.expectError(error.DaemonNotRunning, connectTo(path));
+    try std.testing.expectError(error.DaemonNotRunning, connectTo(io, path));
 
     // 监听后直接关闭、保留 socket 文件：连接得到 ECONNREFUSED（死实例的典型残留）
-    var listener = try (try std.net.Address.initUnix(path)).listen(.{});
-    listener.deinit();
-    try std.testing.expectError(error.DaemonNotRunning, connectTo(path));
+    var addr = try std.Io.net.UnixAddress.init(path);
+    var listener = try addr.listen(io, .{});
+    listener.deinit(io);
+    try std.testing.expectError(error.DaemonNotRunning, connectTo(io, path));
 }
 
 test "wire_errors：daemon 经 IPC 上线的错误都在册，链路错误与连接上限无误漏" {
@@ -610,8 +686,8 @@ test "wire_errors：daemon 经 IPC 上线的错误都在册，链路错误与连
         "BadResponse",
     }) |name| {
         var found = false;
-        inline for (@typeInfo(wire_errors).error_set.?) |e| {
-            if (std.mem.eql(u8, name, e.name)) found = true;
+        inline for (@typeInfo(wire_errors).error_set.error_names.?) |known| {
+            if (std.mem.eql(u8, name, known)) found = true;
         }
         try std.testing.expect(found);
     }
