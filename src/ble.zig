@@ -24,10 +24,117 @@ const log = @import("root.zig").log;
 // 测试用：把诊断输出改道，避免 zig build test 被“BlueZ D-Bus 失败”之类刷屏
 const setLogSink = @import("root.zig").setLogSink;
 const discardLog = @import("root.zig").discardLog;
+const sleepMs = @import("root.zig").sleepMs;
+const closeFd = @import("root.zig").closeFd;
 
-const c = @cImport({
-    @cInclude("systemd/sd-bus.h");
-});
+/// sd-bus 的最小 C ABI 绑定。
+///
+/// Zig 0.17 起 `@cImport` 已从语言移除（0.16 弃用，C 翻译迁到构建系统/外部包）。
+/// 本项目只用到 sd-bus 的 28 个函数与 3 个不透明类型，而这些符号属于 libsystemd
+/// 的稳定 C ABI；直接声明 `extern` 比引入 translate-c 依赖更小更快，也让构建不再
+/// 需要系统头文件（发行版打包与交叉编译都退化成纯 `-lsystemd` 链接）。
+/// 签名逐条对应 systemd 的 `systemd/sd-bus.h`。
+const c = struct {
+    pub const sd_bus = opaque {};
+    pub const sd_bus_message = opaque {};
+    pub const sd_bus_slot = opaque {};
+
+    /// systemd 的 sd_bus_error：错误名、可读消息与“是否由库分配内存”标志。
+    pub const sd_bus_error = extern struct {
+        name: ?[*:0]const u8 = null,
+        message: ?[*:0]const u8 = null,
+        _need_free: c_int = 0,
+    };
+
+    pub const sd_bus_message_handler_t = *const fn (
+        m: ?*sd_bus_message,
+        userdata: ?*anyopaque,
+        ret_error: ?*sd_bus_error,
+    ) callconv(.c) c_int;
+
+    // --- 总线 ---
+    pub extern fn sd_bus_open_system(ret: *?*sd_bus) c_int;
+    pub extern fn sd_bus_new(ret: *?*sd_bus) c_int;
+    pub extern fn sd_bus_flush_close_unref(bus: *sd_bus) *sd_bus;
+    pub extern fn sd_bus_set_fd(bus: *sd_bus, input_fd: c_int, output_fd: c_int) c_int;
+    pub extern fn sd_bus_start(bus: *sd_bus) c_int;
+    pub extern fn sd_bus_process(bus: *sd_bus, ret: ?*?*sd_bus_message) c_int;
+    pub extern fn sd_bus_wait(bus: *sd_bus, timeout_usec: u64) c_int;
+    pub extern fn sd_bus_call(
+        bus: *sd_bus,
+        m: *sd_bus_message,
+        usec: u64,
+        ret_error: ?*sd_bus_error,
+        reply: ?*?*sd_bus_message,
+    ) c_int;
+    pub extern fn sd_bus_add_match(
+        bus: *sd_bus,
+        slot: ?*?*sd_bus_slot,
+        match: [*:0]const u8,
+        callback: sd_bus_message_handler_t,
+        userdata: ?*anyopaque,
+    ) c_int;
+    pub extern fn sd_bus_slot_unref(s: *sd_bus_slot) *sd_bus_slot;
+    pub extern fn sd_bus_error_free(e: *sd_bus_error) void;
+
+    // --- 消息生命周期 ---
+    pub extern fn sd_bus_message_unref(m: *sd_bus_message) *sd_bus_message;
+    pub extern fn sd_bus_message_new_method_call(
+        bus: *sd_bus,
+        ret: *?*sd_bus_message,
+        destination: [*:0]const u8,
+        path: [*:0]const u8,
+        interface: [*:0]const u8,
+        member: [*:0]const u8,
+    ) c_int;
+    pub extern fn sd_bus_message_new_signal(
+        bus: *sd_bus,
+        ret: *?*sd_bus_message,
+        path: [*:0]const u8,
+        interface: [*:0]const u8,
+        member: [*:0]const u8,
+    ) c_int;
+    pub extern fn sd_bus_message_seal(m: *sd_bus_message, cookie: u64, timeout_usec: u64) c_int;
+
+    // --- 构造 ---
+    pub extern fn sd_bus_message_append_basic(m: *sd_bus_message, typ: u8, p: ?*const anyopaque) c_int;
+    pub extern fn sd_bus_message_append_array(
+        m: *sd_bus_message,
+        typ: u8,
+        ptr: ?*const anyopaque,
+        size: usize,
+    ) c_int;
+    pub extern fn sd_bus_message_open_container(
+        m: *sd_bus_message,
+        typ: u8,
+        contents: ?[*:0]const u8,
+    ) c_int;
+    pub extern fn sd_bus_message_close_container(m: *sd_bus_message) c_int;
+
+    // --- 读取 ---
+    pub extern fn sd_bus_message_rewind(m: *sd_bus_message, complete: c_int) c_int;
+    pub extern fn sd_bus_message_enter_container(
+        m: *sd_bus_message,
+        typ: u8,
+        contents: ?[*:0]const u8,
+    ) c_int;
+    pub extern fn sd_bus_message_exit_container(m: *sd_bus_message) c_int;
+    pub extern fn sd_bus_message_at_end(m: *sd_bus_message, complete: c_int) c_int;
+    pub extern fn sd_bus_message_skip(m: *sd_bus_message, types: ?[*:0]const u8) c_int;
+    pub extern fn sd_bus_message_read_basic(m: *sd_bus_message, typ: u8, p: ?*anyopaque) c_int;
+    pub extern fn sd_bus_message_read_array(
+        m: *sd_bus_message,
+        typ: u8,
+        ptr: *?*const anyopaque,
+        size: *usize,
+    ) c_int;
+    pub extern fn sd_bus_message_is_signal(
+        m: *sd_bus_message,
+        interface: ?[*:0]const u8,
+        member: ?[*:0]const u8,
+    ) c_int;
+    pub extern fn sd_bus_message_get_path(m: *sd_bus_message) ?[*:0]const u8;
+};
 
 /// 请求头字节（spec §3）。
 pub const magic: u8 = 0xee;
@@ -126,7 +233,7 @@ pub fn decodeResponse(raw: []const u8, command: protocol.Command, offset: u16, l
     if (raw[0] != magic) return error.BadMagic;
     if (raw[2] > max_payload) return error.BadLength;
     if (raw.len != 5 + @as(usize, raw[2])) return error.BadLength; // 变长帧：无填充
-    if (raw[1] != @intFromEnum(command)) return error.CommandMismatch;
+    if (raw[1] != @backingInt(command)) return error.CommandMismatch;
     if (raw[2] != len) return error.LengthMismatch;
     const got = @as(u16, raw[3]) | (@as(u16, raw[4]) << 8);
     if (got != offset) return error.OffsetMismatch;
@@ -138,7 +245,7 @@ pub fn decodeResponse(raw: []const u8, command: protocol.Command, offset: u16, l
 fn encode(buf: *[frame_len]u8, command: protocol.Command, offset: u16, len: u8, payload: []const u8) void {
     @memset(buf, 0);
     buf[0] = magic;
-    buf[1] = @intFromEnum(command);
+    buf[1] = @backingInt(command);
     buf[2] = len;
     std.mem.writeInt(u16, buf[3..5], offset, .little);
     @memcpy(buf[5..][0..payload.len], payload);
@@ -271,7 +378,7 @@ pub const Device = struct {
         // 否则适配器会一直停在 LE 扫描态；用独立期限，扫描本身耗到期限也能真停掉。
         defer if (scanning) stopDiscoveryBestEffort(bus_ptr, adapter.z(), budget_ms);
         while (cands.len == 0 and monoMs() < deadline) {
-            std.Thread.sleep(scan_poll_ms * std.time.ns_per_ms);
+            sleepMs(scan_poll_ms);
             _ = try find(bus_ptr, &FindDevices{ .out = &cands }, deadline);
         }
         // 正常出口先停一次：后面还要 Connect，不该把扫描带进连接阶段
@@ -360,10 +467,11 @@ pub const Device = struct {
         self.notify_deadline_ms = self.opDeadline(); // 事务开始即定死，事务内不续期
         try self.notify.path.set(self.notify_path.slice());
         var rule_buf: [512]u8 = undefined;
-        const rule = std.fmt.bufPrintZ(
+        const rule = std.fmt.bufPrintSentinel(
             &rule_buf,
             "type='signal',sender='{s}',path='{s}',interface='{s}',member='PropertiesChanged',arg0='{s}'",
             .{ service_name, self.notify_path.slice(), props_iface, char_iface },
+            0,
         ) catch return error.DbusError;
         var slot: ?*c.sd_bus_slot = null;
         try check(c.sd_bus_add_match(self.bus, &slot, rule.ptr, onNotify, @ptrCast(&self.notify)));
@@ -427,8 +535,8 @@ fn onNotify(m: ?*c.sd_bus_message, userdata: ?*anyopaque, ret_error: ?*c.sd_bus_
     const msg = m orelse return 0;
     const ctx: *NotifyCtx = @ptrCast(@alignCast(userdata orelse return 0));
     if (c.sd_bus_message_is_signal(msg, props_iface, "PropertiesChanged") <= 0) return 0;
-    const path = c.sd_bus_message_get_path(msg);
-    if (path == null or !std.mem.eql(u8, std.mem.span(path), ctx.path.slice())) return 0;
+    const path = c.sd_bus_message_get_path(msg) orelse return 0;
+    if (!std.mem.eql(u8, std.mem.span(path), ctx.path.slice())) return 0;
     readChangedValue(msg, ctx) catch {};
     return 0;
 }
@@ -554,7 +662,7 @@ fn variantEnter(m: *c.sd_bus_message, contents: [:0]const u8) Error!bool {
     if (r == 0) return false;
     if (r < 0) {
         // -ENXIO：此处没有该类型的容器（对我们就是“类型不符”）
-        if (r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.NXIO)))) return false;
+        if (r == -@as(c_int, @intCast(@backingInt(std.posix.E.NXIO)))) return false;
         return error.DbusError;
     }
     return true;
@@ -840,7 +948,7 @@ fn waitResolved(bus: *c.sd_bus, dev: [:0]const u8, deadline_ms: i64) Error!void 
         };
         if (resolved) return;
         if (monoMs() >= deadline_ms) return error.ResolveTimeout;
-        std.Thread.sleep(resolve_poll_ms * std.time.ns_per_ms);
+        sleepMs(resolve_poll_ms);
     }
 }
 
@@ -886,7 +994,7 @@ fn callBus(bus: *c.sd_bus, m: *c.sd_bus_message, deadline_ms: i64) Error!*c.sd_b
 
 /// D-Bus 错误 → 可诊断错误。只记录错误名（消息可能含设备地址，不入日志）。
 fn mapCallError(err: *const c.sd_bus_error, r: c_int) Error {
-    const name: []const u8 = if (err.name != null) std.mem.span(err.name) else "";
+    const name: []const u8 = if (err.name) |n| std.mem.span(n) else "";
     if (std.mem.eql(u8, name, "org.freedesktop.DBus.Error.AccessDenied") or
         std.mem.eql(u8, name, "org.bluez.Error.NotAuthorized"))
         return error.BleAccessDenied;
@@ -907,13 +1015,13 @@ fn mapCallError(err: *const c.sd_bus_error, r: c_int) Error {
     if (std.mem.eql(u8, name, "org.bluez.Error.InProgress") or
         std.mem.eql(u8, name, "org.bluez.Error.AlreadyConnected"))
         return error.InProgress;
-    if (r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.TIMEDOUT)))) return error.Timeout;
-    if (r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.ACCES))) or
-        r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.PERM))))
+    if (r == -@as(c_int, @intCast(@backingInt(std.posix.E.TIMEDOUT)))) return error.Timeout;
+    if (r == -@as(c_int, @intCast(@backingInt(std.posix.E.ACCES))) or
+        r == -@as(c_int, @intCast(@backingInt(std.posix.E.PERM))))
         return error.BleAccessDenied;
-    if (r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.CONNRESET))) or
-        r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.PIPE))) or
-        r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.NOTCONN))))
+    if (r == -@as(c_int, @intCast(@backingInt(std.posix.E.CONNRESET))) or
+        r == -@as(c_int, @intCast(@backingInt(std.posix.E.PIPE))) or
+        r == -@as(c_int, @intCast(@backingInt(std.posix.E.NOTCONN))))
         return error.NotConnected;
     if (name.len > 0) log("f9d: BlueZ D-Bus 失败: {s}", .{name});
     return error.DbusError;
@@ -921,8 +1029,8 @@ fn mapCallError(err: *const c.sd_bus_error, r: c_int) Error {
 
 /// 系统总线连不上（未运行 / 无权限 / 无 socket）。
 fn openBusError(r: c_int) Error {
-    if (r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.ACCES))) or
-        r == -@as(c_int, @intCast(@intFromEnum(std.posix.E.PERM))))
+    if (r == -@as(c_int, @intCast(@backingInt(std.posix.E.ACCES))) or
+        r == -@as(c_int, @intCast(@backingInt(std.posix.E.PERM))))
         return error.BleAccessDenied;
     log("f9d: 无法连接 system bus（BlueZ 未运行或未启用）", .{});
     return error.BluezUnavailable;
@@ -1027,7 +1135,7 @@ const FakeGatt = struct {
 fn responseFrame(buf: *[frame_len]u8, command: protocol.Command, offset: u16, len: u8, data: []const u8) []const u8 {
     @memset(buf, 0);
     buf[0] = magic;
-    buf[1] = @intFromEnum(command);
+    buf[1] = @backingInt(command);
     buf[2] = len;
     std.mem.writeInt(u16, buf[3..5], offset, .little);
     @memcpy(buf[5..][0..data.len], data);
@@ -1349,8 +1457,8 @@ const TestBus = struct {
     fn init() !TestBus {
         var fds: [2]std.posix.fd_t = undefined;
         if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SkipZigTest;
-        errdefer std.posix.close(fds[0]);
-        errdefer std.posix.close(fds[1]);
+        errdefer closeFd(fds[0]);
+        errdefer closeFd(fds[1]);
 
         var bus: ?*c.sd_bus = null;
         try check(c.sd_bus_new(&bus));
@@ -1362,7 +1470,7 @@ const TestBus = struct {
     }
 
     fn deinit(self: *TestBus) void {
-        std.posix.close(self.peer);
+        closeFd(self.peer);
         _ = c.sd_bus_flush_close_unref(self.bus);
     }
 
@@ -1634,7 +1742,7 @@ test "mapCallError：BlueZ/D-Bus 错误名与 errno 映射为可诊断错误" {
     const log_prev = setLogSink(discardLog);
     defer _ = setLogSink(log_prev);
     // 名字优先判定；r 用 -EIO 占位，避免 -1 恰好等于 -EPERM 把名字分支掩盖掉
-    const Case = struct { name: [:0]const u8, r: c_int = -@as(c_int, @intCast(@intFromEnum(std.posix.E.IO))), want: Error };
+    const Case = struct { name: [:0]const u8, r: c_int = -@as(c_int, @intCast(@backingInt(std.posix.E.IO))), want: Error };
     const cases = [_]Case{
         .{ .name = "org.freedesktop.DBus.Error.AccessDenied", .want = error.BleAccessDenied },
         .{ .name = "org.bluez.Error.NotAuthorized", .want = error.BleAccessDenied },
@@ -1650,14 +1758,14 @@ test "mapCallError：BlueZ/D-Bus 错误名与 errno 映射为可诊断错误" {
         .{ .name = "org.bluez.Error.NotConnected", .want = error.NotConnected },
         .{ .name = "org.bluez.Error.InProgress", .want = error.InProgress },
         .{ .name = "org.bluez.Error.AlreadyConnected", .want = error.InProgress },
-        .{ .name = "", .r = -@as(c_int, @intCast(@intFromEnum(std.posix.E.TIMEDOUT))), .want = error.Timeout },
-        .{ .name = "", .r = -@as(c_int, @intCast(@intFromEnum(std.posix.E.ACCES))), .want = error.BleAccessDenied },
-        .{ .name = "", .r = -@as(c_int, @intCast(@intFromEnum(std.posix.E.PERM))), .want = error.BleAccessDenied },
-        .{ .name = "", .r = -@as(c_int, @intCast(@intFromEnum(std.posix.E.CONNRESET))), .want = error.NotConnected },
-        .{ .name = "", .r = -@as(c_int, @intCast(@intFromEnum(std.posix.E.PIPE))), .want = error.NotConnected },
-        .{ .name = "", .r = -@as(c_int, @intCast(@intFromEnum(std.posix.E.NOTCONN))), .want = error.NotConnected },
+        .{ .name = "", .r = -@as(c_int, @intCast(@backingInt(std.posix.E.TIMEDOUT))), .want = error.Timeout },
+        .{ .name = "", .r = -@as(c_int, @intCast(@backingInt(std.posix.E.ACCES))), .want = error.BleAccessDenied },
+        .{ .name = "", .r = -@as(c_int, @intCast(@backingInt(std.posix.E.PERM))), .want = error.BleAccessDenied },
+        .{ .name = "", .r = -@as(c_int, @intCast(@backingInt(std.posix.E.CONNRESET))), .want = error.NotConnected },
+        .{ .name = "", .r = -@as(c_int, @intCast(@backingInt(std.posix.E.PIPE))), .want = error.NotConnected },
+        .{ .name = "", .r = -@as(c_int, @intCast(@backingInt(std.posix.E.NOTCONN))), .want = error.NotConnected },
         .{ .name = "org.bluez.Error.Failed", .want = error.DbusError },
-        .{ .name = "", .r = -@as(c_int, @intCast(@intFromEnum(std.posix.E.INVAL))), .want = error.DbusError },
+        .{ .name = "", .r = -@as(c_int, @intCast(@backingInt(std.posix.E.INVAL))), .want = error.DbusError },
     };
     for (cases) |case| {
         var err: c.sd_bus_error = std.mem.zeroes(c.sd_bus_error);
@@ -1844,7 +1952,7 @@ test "parseGatt：一次 GetManagedObjects 定位服务与两个特征，不依�
 
 test "Str.set：超长路径不截断，直接报 DbusError" {
     var s: Str = .{};
-    const too_long = [_]u8{'p'} ** path_max;
+    const too_long: [path_max]u8 = @splat('p');
     try std.testing.expectError(error.DbusError, s.set(&too_long));
     try std.testing.expectEqual(@as(usize, 0), s.len); // 失败不留半个字符串
 

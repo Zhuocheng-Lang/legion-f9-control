@@ -98,7 +98,8 @@
 - sd-bus 编解码（`parseProps`、`walkObjects`、`readChangedValue`、variant 各类型、
   错误名映射）用**离线 bus**（`sd_bus_new` + socketpair + `sd_bus_start`）构造或解析真实
   消息容器：不连接 system bus、不需要 BlueZ 或蓝牙硬件。消息写完后必须 `sd_bus_message_seal`
-  才能从头读。
+  才能从头读。Zig 0.17 移除 `@cImport` 后，夹具仍调用真实 sd-bus（符号来自链接的
+  `libsystemd`），只是声明换成了本模块内的 `extern` 绑定，测试没有被 mock 替代。
 - 真机验收（须具备设备和 BlueZ）：拔 USB 后 `f9ctl status`、`f9ctl gear`、
   `f9ctl gear quiet` 并回读；断开/重连 BLE 后再次请求可恢复；设备不在附近、BlueZ 未启动、
   无法写特征、无通知分别能在限定时间内结束并给出明确错误。改变挡位可能影响实际风扇，

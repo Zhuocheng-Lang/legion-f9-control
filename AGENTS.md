@@ -16,6 +16,7 @@ Zig 实现的联想 Legion F9 控制工具：`f9ctl`（CLI）+ `f9d`（daemon）
 - 设置挡位要保持现有会话读-改-写-关闭与回读确认语义；已打开会话出错时尽力关闭。不要在无真机证据时放松帧校验（USB 校验和、读命令回显、BLE 变长帧与 offset/长度匹配）。
 - 避免新增无用途的命令、抽象和依赖。保持协议编码、传输、业务操作及 IPC 的现有边界。
 - 新增/重命名 daemon 错误时同步 `src/ipc.zig` 的 `wire_errors` 与 `src/main.zig` 的文案（测试会逐项检查）。
+- BLE 的 sd-bus 绑定是本项目内的显式 `extern` 声明（Zig 0.17 已移除 `@cImport`，见 `src/ble.zig` 顶部）。新增 sd-bus 调用时补那里的声明；不要退回 `@cImport`、translate-c 或引入外部绑定包。
 
 ## 目录与命令
 
