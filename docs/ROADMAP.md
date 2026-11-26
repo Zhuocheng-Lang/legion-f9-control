@@ -2,11 +2,14 @@
 
 ## 当前状态
 
-- `0.1.0`：USB/BLE 双链路、状态读取、挡位读写、JSON 输出、链路/ socket 选择、
-  systemd 单元、udev 规则、bash/zsh/fish 补全、`f9ctl(1)` 手册页、`zig build install`
-  安装布局与 CI 已完成。
+- `0.2.0`：**工具链从 Zig 0.15.1 升级到 0.17.1**（`std.Io` I/O 接口、`@cImport`
+  移除后的显式 sd-bus 绑定、环境变量去全局化、`std.posix` 中层包装移除），
+  功能面与 `0.1.0` 相同：USB/BLE 双链路、状态读取、挡位读写、JSON 输出、
+  链路/ socket 选择、systemd 单元、udev 规则、bash/zsh/fish 补全、`f9ctl(1)`
+  手册页、`zig build install` 安装布局与 CI。
 - 离线验证：`mise run check`（格式、单元测试、构建、敏感信息检查）。
-- 真机验证：2026-09-21/24 的 USB 与 BLE 验收、2026-11-25 的 BLE 复测见下文。
+- 真机验证：2026-09-21/24 的 USB 与 BLE 验收、2026-11-25 的 BLE 复测与迁移后复测
+  见下文。
   本轮 BLE 侧改动（复用探活、预算短路、强制链路、优雅退出）已在真机复测通过；
   **USB 侧改动与超时/多候选等异常场景仍只有离线测试**，下表“未验收”项据此保持诚实标注。
 
@@ -20,6 +23,8 @@
 - 两台同类 BLE 设备同时在线时只采纳选中设备下的服务/特征（只有离线单测）；
 - BLE 多候选回退（BlueZ 缓存旧设备 + 真设备）与 `ConnectTimeout`/`ResolveTimeout` 的实机表现；
 - BlueZ 未启动、无通知、写特征不支持 write-with-response、真机响应帧长异常。
+- 交叉编译（`-Dtarget=<triple>`）：`build.zig` 保留了纯 `-lsystemd` 的回退分支，但没有
+  构建证据，也未确认目标 sysroot 是否提供 libsystemd，按“未验收”对待。
 - 复测入口：本轮新增 `f9ctl --link usb|ble` 可强制单链路；`UsbAccessDenied` 可用
   无 udev 规则的非 root 终端复现；`f9ctl --socket <路径>` 便于隔离测试实例。
 
@@ -55,6 +60,54 @@
   真正收紧时再换用户组/polkit。
 
 ## 真机验收记录
+
+### 20261125：root 实例与连接上限补测（pkexec 授权）
+
+环境：同一台机器（仅蓝牙连接的风刃 F9，USB 17ef:f00c 未接入）。经 `pkexec` 以 root
+启动 `f9d`（未设 `XDG_RUNTIME_DIR`），再用普通用户 `f9ctl` 访问；测试后 `/run/f9d`
+已清理。
+
+已验收（均通过）：
+
+- root 实例自动创建 `/run/f9d`（0755 root:root），socket 为 `0666 root:root`、`.lock` 为 0644：
+  `setFilePermissions` 失败语义恢复为“失败即退出”后，这条路径在真机上确实成功；
+- 非 root 客户端按默认路径连上 root 实例（用户级 socket 不存在时才会走到这里）：
+  `status` 38ms 返回真实转速、`gear` 为 `quiet`；`--json` 字段齐全；
+  `--socket /run/f9d/f9d.sock` 同样可用；
+- `--link usb status` 4ms 报“未找到设备”且不回落 BLE；随后的 `--link ble status` 47ms 成功；
+- 5 组并行 `status` 全部成功（设备访问仍由互斥锁串行，无互相破坏）；
+- 连接上限：占满 8 条沉默连接后，第 9 个请求立即得到“f9d 连接数已满，请稍后重试”
+  （`ServerBusy` 作为正常回包送达，不是连接重置）；释放后立即恢复；
+- 双开保护：第二个 root 实例输出 `f9d: 启动失败: AlreadyRunning`（退出码 1），
+  在用的 socket 未被删除；
+- 优雅退出：`SIGTERM` 后退出码 0，`/run/f9d/f9d.sock` 被删除、`.lock` 保留（符合设计）；
+- root 实例忽略 `XDG_RUNTIME_DIR`：设成 `/tmp/...` 时 socket 仍只落在
+  `/run/f9d/f9d.sock`，该目录下未生成 socket（对应 `daemonSocketPath` 的 root 分支）。
+
+仍未验收：USB 侧全部改动（本机未接有线接口，`--link usb` 只验证“未找到设备”路径）、
+`ConnectTimeout`/`ResolveTimeout`、BLE 多候选回退。
+
+### 20261125：Zig 0.17.1 迁移后的 BLE 复测（非 root 用户实例，Linux + BlueZ）
+
+环境：本机仅有蓝牙连接的风刃 F9（USB 17ef:f00c 未接入），以普通用户 + 临时
+`XDG_RUNTIME_DIR`（0700）运行 `f9d`，`f9ctl --socket` 访问隔离实例。
+
+已验收（均通过）：
+
+- 迁移后的 sd-bus 显式 `extern` 绑定可用：首次请求日志显示 USB `DeviceNotFound`
+  → 回落 BLE 成功（`BLE 设备已连接`），说明 `sd_bus_open_system`/`call`/`add_match`/
+  `message_*` 全部符号与签名正确；
+- IPC 走 `std.Io.net`（`UnixAddress.listen/connect`）：`status` 返回真实转速，
+  `gear` 返回 `quiet`；10 组 `status`+`gear` 连续请求全部成功且链路只打开一次；
+- 挡位写入（安全复测）：读取当前挡位 `quiet` 后写回同值，
+  open→read→write→close→回读 82ms 成功，回读仍为 `quiet`；
+- 强制链路：`--link usb status` 在 300ms 内返回 `未找到设备`（不回落 BLE）；
+  `--link ble status` 成功，且随后的自动请求会丢弃并重建 BLE 链路；
+- 优雅退出：`SIGTERM` 后退出码 0，socket 被删除（只剩 `.lock`）。
+
+未复测（本轮无对应真机条件，仍只有离线测试）：USB 侧全部改动（本机未接有线接口）、
+`ConnectTimeout`/`ResolveTimeout`、多候选回退。`ServerBusy` 与 root 实例路径已在
+同日以 `pkexec` 授权补测，见上一节。
 
 ### 20261125：本轮修复后的 BLE 复测（非 root 用户实例，Linux + BlueZ）
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// 发布版本号：与 build.zig.zon 的 version 保持一致（--version 与打包都用它）。
-const version = "0.1.0";
+const version = "0.2.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

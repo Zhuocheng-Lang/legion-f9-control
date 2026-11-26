@@ -9,8 +9,8 @@ spec/design/ROADMAP）、**待真机**（需要设备才能验收，已列入 RO
 验证命令（仓库根目录）：
 
 ```sh
-mise exec -- zig fmt --check src/*.zig build.zig
-mise exec -- zig build test        # 3 个测试 unit：库 + f9ctl + f9d，共 127 项
+mise exec -- zig fmt --check src/*.zig build.zig build.zig.zon
+mise exec -- zig build test --test-timeout 120s   # 3 个测试 unit：库 + f9ctl + f9d，共 130 项
 mise exec -- zig build
 mise exec -- zig build install --prefix /tmp/f9prefix
 ./tools/check-sensitive.sh
